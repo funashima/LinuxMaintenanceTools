@@ -1,869 +1,1209 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Pip Version Manager (PyQt6) — clean rebuild
-- Asynchronous pip via QProcess
-- Versions via: `pip index versions` → PyPI JSON (Qt) → pip-install probe
-- Robust `pip list` parsing with ANSI stripping + importlib.metadata fallback
-- English-only comments as requested
+Pip Version Manager with Dependency Graph (PyQt6)
+
+New in this build:
+- "Include yanked" checkbox (default unchecked). When off, yanked releases are hidden from the list.
+- If a yanked version is selected (only visible when "Include yanked" is ON), the "Install selected" button is disabled.
+
+Also includes:
+- Wider default Package column / left pane
+- Node size control
+- Drag-to-pan, wheel zoom (cursor-centered), click-to-focus
+- Label font size control
+- Depth default -1 (unlimited)
+- Self-loop removal
+- Versions & Info with install (confirmation dialog), live log
+All UI strings and comments are in English.
 """
 from __future__ import annotations
 
 import json
-import os
 import re
 import sys
-import shlex
+import unicodedata
+import urllib.request
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+# ---- Optional imports: graceful degradation ----
+try:
+    import networkx as nx  # type: ignore
+    HAVE_NX = True
+except Exception:
+    HAVE_NX = False
+
+try:
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas  # type: ignore
+    from matplotlib.figure import Figure  # type: ignore
+    from matplotlib import rcParams  # type: ignore
+    from matplotlib.colors import to_rgba  # type: ignore
+    rcParams.setdefault('font.family', ['DejaVu Sans'])
+    HAVE_MPL = True
+except Exception:
+    HAVE_MPL = False
+    FigureCanvas = None  # type: ignore
+    Figure = None  # type: ignore
+
+try:
+    from packaging.requirements import Requirement  # type: ignore
+    from packaging.version import Version, InvalidVersion  # type: ignore
+    HAVE_PKG = True
+except Exception:
+    HAVE_PKG = False
+    class Version:  # crude fallback
+        def __init__(self, s: str) -> None: self._s = s
+        def __lt__(self, other: "Version") -> bool: return str(self) < str(other)
+        def __str__(self) -> str: return self._s
+        @property
+        def is_prerelease(self) -> bool: return any(tag in self._s for tag in ("a", "b", "rc", "dev"))
+    class InvalidVersion(Exception): ...
+
+# ---- Importlib metadata for installed packages ----
+try:
+    import importlib.metadata as ilm  # Python 3.8+
+except Exception:
+    try:
+        import importlib_metadata as ilm  # type: ignore
+    except Exception:
+        ilm = None  # type: ignore
+
+# ---- PyQt6 ----
 from PyQt6.QtCore import (
-    QAbstractTableModel,
-    QItemSelection,
-    QProcess,
-    QSortFilterProxyModel,
-    QTimer,
-    QUrl,
     Qt,
+    QAbstractTableModel,
+    QModelIndex,
+    QSortFilterProxyModel,
     pyqtSignal,
-    QSize,
-    QSettings,
+    QProcess,
 )
-from PyQt6.QtGui import (
-    QAction,
-    QBrush,
-    QColor,
-    QKeySequence,
-    QStandardItem,
-    QStandardItemModel,
-)
+from PyQt6.QtGui import QAction, QKeySequence, QColor, QBrush
 from PyQt6.QtWidgets import (
     QApplication,
-    QCheckBox,
-    QGroupBox,
-    QHeaderView,
-    QLabel,
-    QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
-    QMenu,
-    QMessageBox,
-    QPushButton,
-    QSplitter,
-    QStatusBar,
-    QTableView,
-    QTextEdit,
+    QWidget,
     QVBoxLayout,
     QHBoxLayout,
-    QWidget,
+    QTableView,
+    QLineEdit,
+    QLabel,
     QAbstractItemView,
+    QHeaderView,
+    QSplitter,
+    QGroupBox,
+    QTextEdit,
+    QPlainTextEdit,
+    QTabWidget,
+    QComboBox,
+    QSpinBox,
+    QDoubleSpinBox,
+    QListWidget,
+    QListWidgetItem,
+    QPushButton,
+    QCheckBox,
+    QMessageBox,
 )
 
-# Optional Qt network for non-blocking HTTP
-try:
-    from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
-    HAVE_QTNETWORK = True
-except Exception:
-    HAVE_QTNETWORK = False
 
-# Optional packaging for strong version ordering
-try:
-    from packaging.version import Version as _PkgVersion
-    HAVE_PACKAGING = True
-except Exception:
-    HAVE_PACKAGING = False
-
+# -------------------- Data structures --------------------
 
 @dataclass
-class Package:
+class PackageRow:
     name: str
     version: str
 
 
-def detect_environment() -> Dict[str, str]:
-    """Detect environment flavor (system / virtualenv / conda)."""
-    env = {
-        "type": "system",
-        "name": "",
-        "prefix": sys.prefix,
-        "base_prefix": getattr(sys, "base_prefix", sys.prefix),
-        "executable": sys.executable,
-    }
-    if os.environ.get("CONDA_PREFIX") or os.environ.get("CONDA_DEFAULT_ENV"):
-        env["type"] = "conda"
-        env["name"] = os.environ.get("CONDA_DEFAULT_ENV", "")
-    elif (hasattr(sys, "base_prefix") and sys.prefix != sys.base_prefix) or os.environ.get("VIRTUAL_ENV"):
-        env["type"] = "virtualenv"
-        env["name"] = os.path.basename(os.environ.get("VIRTUAL_ENV", ""))
-    return env
+# -------------------- Utility functions --------------------
+
+_CANON_RE = re.compile(r"[-_.]+")
+
+def canon(name: str) -> str:
+    """PEP 503-like canonicalization for comparing package names."""
+    return _CANON_RE.sub("-", (name or "").strip().lower())
 
 
-def _strip_ansi(text: str) -> str:
-    """Remove ANSI escape sequences (CSI/OSC)."""
-    text = re.sub(r"\x1B\[[0-?]*[ -/]*[@-~]", "", text)         # CSI
-    text = re.sub(r"\x1B\][^\a]*(?:\a|\x1B\\)", "", text)        # OSC
-    return text
-
-
-def extract_json_array(text: str) -> Optional[str]:
-    """
-    Extract a JSON array substring from noisy or colored text.
-    Strategy:
-      1) strip ANSI colors
-      2) prefer arrays that start with "[{"
-      3) bracket-balance scan with string-awareness
-    """
-    s = _strip_ansi(text or "")
-    m = re.search(r"\[\s*\{", s, re.S)
-    start = m.start() if m else -1
-    if start == -1:
-        m2 = re.search(r"\[\s*\]", s)
-        if m2:
-            return s[m2.start():m2.end()]
-        start = s.find("[")
-        if start == -1:
-            return None
-    depth = 0
-    in_string = False
-    esc = False
-    for i in range(start, len(s)):
-        ch = s[i]
-        if in_string:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_string = False
-            continue
-        else:
-            if ch == '"':
-                in_string = True
+def list_installed_packages() -> List[PackageRow]:
+    """Return installed packages using importlib.metadata only."""
+    rows: List[PackageRow] = []
+    if ilm is None:
+        return rows
+    seen: set[str] = set()
+    for dist in ilm.distributions():  # type: ignore[attr-defined]
+        try:
+            md = getattr(dist, "metadata", None)
+            n = (md.get("Name") if md else None) or getattr(dist, "name", None) or ""
+            v = getattr(dist, "version", "") or ""
+            if not n:
                 continue
-            if ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    return s[start:i+1]
-    return None
-
-
-def is_prerelease(v: str) -> bool:
-    """Return True iff version is pre-release; 'post' is NOT pre-release."""
-    if HAVE_PACKAGING:
-        try:
-            return _PkgVersion(v).is_prerelease
+            key = canon(n)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(PackageRow(name=n, version=v))
         except Exception:
-            pass
-    return bool(re.search(r"(?i)(?:a|alpha|b|beta|rc|dev)\d*", v))
+            continue
+    rows.sort(key=lambda r: r.name.casefold())
+    return rows
 
 
-def version_key(v: str):
-    """Ordering key for versions; use packaging if available, else tuple-ish fallback."""
-    if HAVE_PACKAGING:
+def build_dependency_graph(installed: List[PackageRow]) -> Tuple["nx.DiGraph | None", Dict[str, str]]:
+    """
+    Build a directed dependency graph G where edge A -> B means "A depends on B".
+    Only includes nodes that are installed (present in `installed`).
+    Returns (graph, canon_to_display).
+    """
+    if not HAVE_NX or ilm is None:
+        return None, {}
+
+    # Canonical name <-> display name mapping for installed set
+    canon_to_display: Dict[str, str] = {canon(r.name): r.name for r in installed}
+    installed_canon = set(canon_to_display.keys())
+
+    G = nx.DiGraph()
+    for c in installed_canon:
+        G.add_node(c)
+
+    for dist in ilm.distributions():  # type: ignore[attr-defined]
         try:
-            return _PkgVersion(v)
+            meta = getattr(dist, "metadata", None)
+            raw_name = (meta.get("Name") if meta else None) or getattr(dist, "name", None) or ""
+            src = canon(raw_name)
+            if src not in installed_canon:
+                continue
+            reqs = getattr(dist, "requires", None) or []
+            for rline in reqs:
+                target_name = None
+                if HAVE_PKG:
+                    try:
+                        target_name = Requirement(rline).name  # type: ignore
+                    except Exception:
+                        target_name = None
+                if not target_name:
+                    # Fallback rough parse: split at specifiers/markers/extras
+                    target_name = re.split(r"[ ;<>=!~\[\]\(]", rline.strip())[0]
+                tgt = canon(target_name)
+
+                # Skip invalid or self-dependency edges
+                if not tgt or tgt == src:
+                    continue
+
+                if tgt in installed_canon:
+                    G.add_edge(src, tgt)
         except Exception:
-            pass
-    parts: List[Tuple[int, str]] = []
-    for token in re.split(r"[\.\-\+_]", v):
-        if token.isdigit():
-            parts.append((0, str(int(token))))
-        else:
-            parts.append((1, token))
-    return tuple(parts)
+            continue
 
-
-def parse_semver_triplet(v: Optional[str]) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    """Return (major, minor, patch) if available, else (None, None, None)."""
-    if not v:
-        return (None, None, None)
-    m = re.match(r"^\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?", v)
-    if not m:
-        return (None, None, None)
-    return tuple(int(x) if x is not None else 0 for x in m.groups(default="0"))
-
-
-def _collect_installed_importlib() -> List[Package]:
-    """Enumerate installed distributions via importlib.metadata as fallback."""
+    # Remove any self-loops just in case
     try:
-        import importlib.metadata as _ilm
+        G.remove_edges_from(nx.selfloop_edges(G))
     except Exception:
-        try:
-            import importlib_metadata as _ilm  # backport
-        except Exception:
-            _ilm = None
-    pkgs: List[Package] = []
-    if _ilm is None:
-        return pkgs
+        for u, v in list(G.edges()):
+            if u == v:
+                G.remove_edge(u, v)
+
+    # Attach display labels
     try:
-        for dist in _ilm.distributions():
-            name = None
-            version = None
-            try:
-                md = getattr(dist, "metadata", None)
-                if md:
-                    name = md.get("Name") or md.get("name") or getattr(dist, "name", None)
-                else:
-                    name = getattr(dist, "metadata", {}).get("Name", None)  # type: ignore[call-arg]
-                version = getattr(dist, "version", None)
-            except Exception:
-                pass
-            if name and version:
-                pkgs.append(Package(name, str(version)))
+        nx.set_node_attributes(G, {c: {"label": canon_to_display.get(c, c)} for c in G.nodes})
     except Exception:
         pass
-    uniq: Dict[str, Package] = {}
-    for p in pkgs:
-        k = p.name.lower()
-        if k not in uniq:
-            uniq[k] = p
-    return sorted(uniq.values(), key=lambda x: x.name.lower())
+    return G, canon_to_display
 
 
-class InstalledModel(QStandardItemModel):
-    """Two-column model: name | installed version."""
+def safe_label(text: object, ascii_only: bool = False) -> str:
+    """Return a glyph-safe label. Normalize and optionally strip to ASCII."""
+    s = "" if text is None else str(text)
+    s = unicodedata.normalize("NFKC", s)
+    if ascii_only:
+        return s.encode("ascii", "ignore").decode("ascii")
+    return "".join(ch if ch.isprintable() else " " for ch in s)
+
+
+# -------------------- Fetch versions from PyPI --------------------
+
+def fetch_pypi_versions(project_name: str) -> Tuple[List[str], Dict[str, Dict]]:
+    """
+    Fetch versions from PyPI JSON API.
+    Returns (version_strings, releases_meta)
+      - version_strings: list of all version tags (as strings)
+      - releases_meta: mapping version -> aggregated info:
+            {
+              "is_prerelease": bool,
+              "yanked": bool,
+              "upload_time": str | None
+            }
+    """
+    project = canon(project_name)
+    url = f"https://pypi.org/pypi/{project}/json"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return [], {}
+
+    releases = data.get("releases", {}) or {}
+    versions = list(releases.keys())
+    meta: Dict[str, Dict] = {}
+    for v in versions:
+        files = releases.get(v) or []
+        times = [f.get("upload_time_iso_8601") for f in files if f.get("upload_time_iso_8601")]
+        newest = max(times) if times else None
+        yanked_flags = [bool(f.get("yanked")) for f in files]
+        yanked = all(yanked_flags) if files else False
+        try:
+            ver = Version(v)  # type: ignore
+            is_pre = bool(getattr(ver, "is_prerelease", False))
+        except Exception:
+            is_pre = any(t in v for t in ("a", "b", "rc", "dev"))
+        meta[v] = {"is_prerelease": is_pre, "yanked": yanked, "upload_time": newest}
+    return versions, meta
+
+
+def sort_versions_desc(versions: List[str]) -> List[str]:
+    def key(v: str):
+        try:
+            return Version(v)  # type: ignore
+        except Exception:
+            return Version("0!" + v) if HAVE_PKG else Version(v)  # type: ignore
+    return sorted(versions, key=key, reverse=True)
+
+
+# -------------------- Qt models & widgets --------------------
+
+class InstalledTableModel(QAbstractTableModel):
     COL_NAME = 0
-    COL_VER = 1
+    COL_VERSION = 1
+    HEADERS = ["Package", "Version"]
 
-    def __init__(self) -> None:
-        super().__init__(0, 2)
-        self.setHorizontalHeaderLabels(["Package", "Installed Version"])
-
-    def set_packages(self, pkgs: List[Package]) -> None:
-        self.setRowCount(0)
-        for p in pkgs:
-            it_name = QStandardItem(p.name)
-            it_ver = QStandardItem(p.version)
-            it_name.setEditable(False)
-            it_ver.setEditable(False)
-            self.appendRow([it_name, it_ver])
-
-
-class PipRunner(QProcess):
-    """Wrapper for QProcess to run `python -m pip` and stream logs."""
-    outputReady = pyqtSignal(str)
-    finishedOk = pyqtSignal(int, str)
-    finishedErr = pyqtSignal(int, str)
-
-    def __init__(self, parent=None) -> None:
+    def __init__(self, rows: Optional[List[PackageRow]] = None, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        self.readyReadStandardOutput.connect(self._on_read)
-        self.finished.connect(self._on_finished)
-        self._buf: List[str] = []
+        self._rows: List[PackageRow] = rows or []
 
-    def run(self, args: List[str]) -> None:
-        self._buf.clear()
-        self.start(sys.executable, ["-m", "pip"] + args)
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # type: ignore[override]
+        return 0 if parent.isValid() else len(self._rows)
 
-    def _on_read(self) -> None:
-        data = self.readAllStandardOutput().data().decode(errors="replace")
-        if data:
-            self._buf.append(data)
-            self.outputReady.emit(data)
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:  # type: ignore[override]
+        return 0 if parent.isValid() else 2
 
-    def _on_finished(self, code: int, _status: QProcess.ExitStatus) -> None:
-        text = "".join(self._buf)
-        if code == 0:
-            self.finishedOk.emit(code, text)
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole):  # type: ignore[override]
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        if orientation == Qt.Orientation.Horizontal:
+            return self.HEADERS[section]
+        return section + 1
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):  # type: ignore[override]
+        if not index.isValid():
+            return None
+        r = self._rows[index.row()]
+        if role == Qt.ItemDataRole.DisplayRole:
+            if index.column() == self.COL_NAME:
+                return r.name
+            if index.column() == self.COL_VERSION:
+                return r.version
+        return None
+
+    def set_rows(self, rows: List[PackageRow]) -> None:
+        self.beginResetModel()
+        self._rows = rows
+        self.endResetModel()
+
+    def row_at(self, proxy_index: QModelIndex, proxy: QSortFilterProxyModel) -> Optional[PackageRow]:
+        if not proxy_index.isValid():
+            return None
+        src = proxy.mapToSource(proxy_index)
+        if not src.isValid():
+            return None
+        i = src.row()
+        if i < 0 or i >= len(self._rows):
+            return None
+        return self._rows[i]
+
+
+
+class CaseInsensitiveStableProxy(QSortFilterProxyModel):
+    """
+    QSortFilterProxyModel with case-insensitive, *stable* sorting.
+    - Compare strings with .casefold() for all columns.
+    - Ties are broken by original source row index to preserve input order.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.setSortCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+
+    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:  # type: ignore[override]
+        src = self.sourceModel()
+        if src is None:
+            return super().lessThan(left, right)
+        ltxt = src.data(left, Qt.ItemDataRole.DisplayRole) or ""
+        rtxt = src.data(right, Qt.ItemDataRole.DisplayRole) or ""
+        lc = str(ltxt).casefold()
+        rc = str(rtxt).casefold()
+        if lc == rc:
+            # Stable: keep original order from the source model
+            return left.row() < right.row()
+        return lc < rc
+
+class GraphPanel(QWidget):
+    """
+    NetworkX dependency visualization panel.
+    Controls: Mode (deps/rdeps), Layout, Depth (-1=unlimited), Label size, Node size.
+    Features: click node to refocus, mouse wheel zoom, drag to pan.
+    """
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.G: Optional["nx.DiGraph"] = None
+        self.canon_to_display: Dict[str, str] = {}
+        self.root: Optional[str] = None  # canonical name
+
+        # Controls row
+        self.mode = QComboBox()
+        self.mode.addItem("Dependencies ->", userData="deps")
+        self.mode.addItem("Dependents <-", userData="rdeps")
+
+        self.layoutSel = QComboBox()
+        self.layoutSel.addItem("kamada-kawai")
+        self.layoutSel.addItem("spring")
+
+        self.depth = QSpinBox()
+        self.depth.setRange(-1, 32)
+        self.depth.setValue(-1)
+        self.depth.setToolTip("Max BFS depth from root (-1 = unlimited)")
+
+        self.labelSize = QSpinBox()
+        self.labelSize.setRange(6, 24)
+        self.labelSize.setValue(11)
+        self.labelSize.setToolTip("Label font size")
+
+        self.nodeSize = QSpinBox()
+        self.nodeSize.setRange(10, 4000)
+        self.nodeSize.setSingleStep(10)
+        self.nodeSize.setValue(400)
+        self.nodeSize.setToolTip("Node circle size (root is 2×)")
+
+        
+        # Node alpha (fill transparency)
+        self.nodeAlpha = QDoubleSpinBox()
+        self.nodeAlpha.setRange(0.0, 1.0)
+        self.nodeAlpha.setDecimals(2)
+        self.nodeAlpha.setSingleStep(0.05)
+        self.nodeAlpha.setValue(1.0)
+        self.nodeAlpha.setToolTip("Node fill alpha (0=transparent, 1=opaque)")
+        ctrl = QWidget()
+        ctrl_h = QHBoxLayout(ctrl)
+        ctrl_h.setContentsMargins(0, 0, 0, 0)
+        ctrl_h.addWidget(QLabel("Mode:"))
+        ctrl_h.addWidget(self.mode)
+        ctrl_h.addSpacing(10)
+        ctrl_h.addWidget(QLabel("Layout:"))
+        ctrl_h.addWidget(self.layoutSel)
+        ctrl_h.addSpacing(10)
+        ctrl_h.addWidget(QLabel("Depth (-1=unlimited):"))
+        ctrl_h.addWidget(self.depth)
+        ctrl_h.addSpacing(10)
+        ctrl_h.addWidget(QLabel("Label size:"))
+        ctrl_h.addWidget(self.labelSize)
+        ctrl_h.addSpacing(10)
+        ctrl_h.addWidget(QLabel("Node size:"))
+        ctrl_h.addWidget(self.nodeSize)
+        ctrl_h.addSpacing(8)
+        ctrl_h.addWidget(QLabel("Node alpha:"))
+        ctrl_h.addWidget(self.nodeAlpha)
+        ctrl_h.addStretch(1)
+
+        # Host widget (canvas or info)
+        self._view = QWidget()
+        self._view_layout = QVBoxLayout(self._view)
+        self._view_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.info = QLabel()
+        self.info.setWordWrap(True)
+        self._current_view_widget: Optional[QWidget] = None
+
+        self.figure: Optional["Figure"] = None
+        self.canvas: Optional["FigureCanvas"] = None
+
+        # State for interactions
+        self._ax = None
+        self._last_pos: Dict[str, Tuple[float, float]] = {}
+        self._mpl_cids: Dict[str, int] = {}
+
+        # Drag/pan state
+        self._panning: bool = False
+        self._pan_button: Optional[int] = None
+        self._pan_start_data: Optional[Tuple[float, float]] = None
+        self._pan_start_xlim: Optional[Tuple[float, float]] = None
+        self._pan_start_ylim: Optional[Tuple[float, float]] = None
+
+        # Click-to-focus state
+        self._press_px: Optional[Tuple[float, float]] = None
+        self._mouse_moved: bool = False
+
+        v = QVBoxLayout(self)
+        v.addWidget(ctrl)
+        v.addWidget(self._view, 1)
+
+        # Hooks
+        self.mode.currentIndexChanged.connect(self._redraw)
+        self.layoutSel.currentIndexChanged.connect(self._redraw)
+        self.depth.valueChanged.connect(self._redraw)
+        self.labelSize.valueChanged.connect(self._redraw)
+        self.nodeSize.valueChanged.connect(self._redraw)
+        self.nodeAlpha.valueChanged.connect(self._redraw)
+
+        self._show_info_if_needed()
+
+    # ---- view helpers ----
+    def _show_info_if_needed(self, message: Optional[str] = None) -> None:
+        if self._current_view_widget is not self.info:
+            if self._current_view_widget:
+                self._view_layout.removeWidget(self._current_view_widget)
+                self._current_view_widget.setParent(None)
+            self._current_view_widget = self.info
+            self._view_layout.addWidget(self.info)
+        if message:
+            self.info.setText(message)
         else:
-            self.finishedErr.emit(code, text)
+            miss = []
+            if not HAVE_NX:
+                miss.append("networkx")
+            if not HAVE_MPL:
+                miss.append("matplotlib")
+            if miss:
+                self.info.setText(
+                    "Graph view requires: "
+                    + ", ".join(miss)
+                    + "\nInstall with: python -m pip install "
+                    + " ".join(miss)
+                )
+            else:
+                self.info.setText("Select a package to visualize")
 
+    def _ensure_canvas(self) -> bool:
+        if not HAVE_MPL or Figure is None or FigureCanvas is None:
+            self._show_info_if_needed()
+            return False
+        created = False
+        if self.figure is None:
+            try:
+                self.figure = Figure(figsize=(5, 4), constrained_layout=True)
+                created = True
+            except Exception:
+                self._show_info_if_needed("Failed to create matplotlib Figure")
+                return False
+        if self.canvas is None:
+            try:
+                self.canvas = FigureCanvas(self.figure)  # type: ignore[arg-type]
+                created = True
+            except Exception:
+                self._show_info_if_needed("Failed to create matplotlib Canvas")
+                return False
+        if created or (self._current_view_widget is not self.canvas):
+            if self._current_view_widget:
+                self._view_layout.removeWidget(self._current_view_widget)
+                self._current_view_widget.setParent(None)
+            self._current_view_widget = self.canvas  # type: ignore[assignment]
+            self._view_layout.addWidget(self.canvas)  # type: ignore[arg-type]
+
+        # Connect mpl events once
+        if self.canvas and 'press' not in self._mpl_cids:
+            self._mpl_cids['press'] = self.canvas.mpl_connect('button_press_event', self._on_press)
+        if self.canvas and 'release' not in self._mpl_cids:
+            self._mpl_cids['release'] = self.canvas.mpl_connect('button_release_event', self._on_release)
+        if self.canvas and 'motion' not in self._mpl_cids:
+            self._mpl_cids['motion'] = self.canvas.mpl_connect('motion_notify_event', self._on_motion)
+        if self.canvas and 'scroll' not in self._mpl_cids:
+            self._mpl_cids['scroll'] = self.canvas.mpl_connect('scroll_event', self._on_scroll)
+        return True
+
+    # Public API
+    def set_dataset(self, G: "nx.DiGraph", canon_to_display: Dict[str, str]) -> None:
+        if not HAVE_NX:
+            self._show_info_if_needed()
+            return
+        self.G = G
+        self.canon_to_display = dict(canon_to_display)
+        self._redraw()
+
+    def set_focus(self, root_canon: Optional[str]) -> None:
+        if not HAVE_NX:
+            return
+        self.root = root_canon if (self.G is not None and root_canon in self.G) else None
+        self._redraw()
+
+    # Internal helpers
+    def _subgraph(self) -> Optional["nx.DiGraph"]:
+        if self.G is None or self.root is None:
+            return None
+        mode = self.mode.currentData()
+        depth_raw = int(self.depth.value())
+        cutoff = None if depth_raw < 0 else depth_raw  # -1 means unlimited
+        Gx = self.G if mode == "deps" else self.G.reverse(copy=False)
+        try:
+            lengths = nx.single_source_shortest_path_length(Gx, self.root, cutoff=cutoff)  # type: ignore
+        except Exception:
+            return None
+        nodes = list(lengths.keys())
+        H = self.G.subgraph(nodes).copy()
+        # Safety: drop self-loops at view time too
+        try:
+            H.remove_edges_from(nx.selfloop_edges(H))
+        except Exception:
+            for u, v in list(H.edges()):
+                if u == v:
+                    H.remove_edge(u, v)
+        return H
+
+    def _redraw(self) -> None:
+        if not HAVE_NX:
+            self._show_info_if_needed()
+            return
+        if not self._ensure_canvas():
+            return
+
+        H = self._subgraph()
+        self.figure.clear()  # do not chain with add_subplot
+        ax = self.figure.add_subplot(111)
+        ax.axis("off")
+        ax.set_aspect("equal", adjustable="datalim")
+        self._ax = ax
+        self._last_pos.clear()
+
+        if not H:
+            ax.text(0.5, 0.5, "Select a package to visualize", ha="center", va="center")
+            self.canvas.draw_idle()
+            return
+
+        # Layout
+        layout = self.layoutSel.currentText()
+        try:
+            if layout == "kamada-kawai":
+                pos = nx.kamada_kawai_layout(H)  # type: ignore
+            else:
+                pos = nx.spring_layout(H, seed=42)  # type: ignore
+        except Exception:
+            pos = nx.spring_layout(H, seed=42)
+
+        # Node styling
+        # Node styling
+        root = self.root
+        base = int(self.nodeSize.value())
+        sizes = [base*2 if n == root else base for n in H.nodes()]
+        alpha = float(getattr(self, "nodeAlpha", None).value()) if hasattr(self, "nodeAlpha") else 1.0
+        if HAVE_MPL and alpha < 1.0:
+            colors = [to_rgba("#ffcc00", alpha=alpha) if n == root else to_rgba("#b9d7fb", alpha=alpha) for n in H.nodes()]
+        else:
+            colors = ["#ffcc00" if n == root else "#b9d7fb" for n in H.nodes()]
+
+        nx.draw_networkx_nodes(H, pos, ax=ax, node_size=sizes, node_color=colors,
+                               edgecolors="#333", linewidths=0.8)
+
+        # --- Directed edges: separate straight vs. reciprocal (curved) ---
+        edges = list(H.edges())
+        processed_pairs = set()  # frozenset({u,v}) for reciprocal pairs handled
+        straight = []
+        curved_a = []
+        curved_b = []
+        for (u, v) in edges:
+            if H.has_edge(v, u):
+                key = frozenset((u, v))
+                if key in processed_pairs:
+                    continue
+                processed_pairs.add(key)
+                curved_a.append((u, v))
+                curved_b.append((v, u))
+            else:
+                straight.append((u, v))
+
+        # Draw straight (single-direction) edges
+        if straight:
+            nx.draw_networkx_edges(
+                H, pos, ax=ax, edgelist=straight,
+                arrows=True, arrowstyle='->', arrowsize=12, width=1.0, alpha=0.9
+            )
+
+        # Draw reciprocal pairs as two curved arcs to make direction clear
+        if curved_a:
+            nx.draw_networkx_edges(
+                H, pos, ax=ax, edgelist=curved_a,
+                arrows=True, arrowstyle='->', arrowsize=12, width=1.0, alpha=0.9,
+                connectionstyle='arc3,rad=0.18'
+            )
+        if curved_b:
+            nx.draw_networkx_edges(
+                H, pos, ax=ax, edgelist=curved_b,
+                arrows=True, arrowstyle='->', arrowsize=12, width=1.0, alpha=0.9,
+                connectionstyle='arc3,rad=-0.18'
+            )
+        # Labels (single-pass; avoid duplicates)
+        # Clear any pre-existing text artists on this axes just in case
+        try:
+            for _t in list(ax.texts):
+                _t.remove()
+        except Exception:
+            pass
+        raw_labels = {n: H.nodes[n].get("label", self.canon_to_display.get(n, n)) for n in H.nodes()}
+        labels = {n: safe_label(v, ascii_only=False) for n, v in raw_labels.items()}
+        fsize = int(self.labelSize.value())
+        labels_drawn = False
+        try:
+            nx.draw_networkx_labels(H, pos, labels=labels, ax=ax, font_size=fsize)
+            labels_drawn = True
+        except Exception:
+            pass
+        if not labels_drawn:
+            labels_ascii = {n: safe_label(v, ascii_only=True) for n, v in raw_labels.items()}
+            try:
+                nx.draw_networkx_labels(H, pos, labels=labels_ascii, ax=ax, font_size=fsize)
+            except Exception:
+                pass
+        # Save positions for interaction
+        self._last_pos = {str(n): (float(x), float(y)) for n, (x, y) in pos.items()}
+
+        # Fit view
+        ax.relim()
+        ax.autoscale_view()
+        self.canvas.draw_idle()
+
+    # ---- interactions ----
+    def _nearest_node(self, event, radius_px: float = 12.0) -> Tuple[Optional[str], float]:
+        """Return (node_id, squared_pixel_distance) for nearest node to event; None if too far."""
+        if self._ax is None or not self._last_pos:
+            return None, float("inf")
+        inv = self._ax.transData
+        min_d2 = None
+        hit_node = None
+        for n, (x, y) in self._last_pos.items():
+            px, py = inv.transform((x, y))
+            dx = px - event.x
+            dy = py - event.y
+            d2 = dx*dx + dy*dy
+            if min_d2 is None or d2 < min_d2:
+                min_d2 = d2
+                hit_node = n
+        if min_d2 is None or min_d2 > radius_px*radius_px:
+            return None, float("inf")
+        return hit_node, float(min_d2)
+
+    def _on_press(self, event) -> None:
+        if self._ax is None or event.inaxes is not self._ax:
+            return
+        self._mouse_moved = False
+        self._press_px = (event.x, event.y)
+
+        # Middle(2) or Right(3): always pan
+        if event.button in (2, 3):
+            self._start_pan(event)
+            return
+
+        # Left(1): if near a node, wait for click; else start pan
+        if event.button == 1:
+            node, d2 = self._nearest_node(event, radius_px=12.0)
+            if node is None:
+                self._start_pan(event)
+
+    def _start_pan(self, event) -> None:
+        if self._ax is None:
+            return
+        self._panning = True
+        self._pan_button = event.button
+        self._pan_start_data = (event.xdata, event.ydata)
+        self._pan_start_xlim = tuple(self._ax.get_xlim())
+        self._pan_start_ylim = tuple(self._ax.get_ylim())
+
+    def _on_motion(self, event) -> None:
+        if self._ax is None or event.inaxes is not self._ax:
+            return
+        if self._press_px is not None:
+            if abs(event.x - self._press_px[0]) > 2 or abs(event.y - self._press_px[1]) > 2:
+                self._mouse_moved = True
+
+        if not self._panning:
+            return
+        if self._pan_start_data is None or self._pan_start_xlim is None or self._pan_start_ylim is None:
+            return
+        x0, y0 = self._pan_start_data
+        if x0 is None or y0 is None or event.xdata is None or event.ydata is None:
+            return
+
+        dx = event.xdata - x0
+        dy = event.ydata - y0
+
+        xlim0 = self._pan_start_xlim
+        ylim0 = self._pan_start_ylim
+        self._ax.set_xlim((xlim0[0] - dx, xlim0[1] - dx))
+        self._ax.set_ylim((ylim0[0] - dy, ylim0[1] - dy))
+        self.canvas.draw_idle()
+
+    def _on_release(self, event) -> None:
+        # Finish panning
+        self._panning = False
+        self._pan_button = None
+        self._pan_start_data = None
+        self._pan_start_xlim = None
+        self._pan_start_ylim = None
+
+        # Left-click without significant movement -> focus node
+        if event.button == 1 and not self._mouse_moved and self._ax is not None and event.inaxes is self._ax:
+            node, d2 = self._nearest_node(event, radius_px=12.0)
+            if node is not None:
+                self.set_focus(node)
+
+        # Reset click state
+        self._press_px = None
+        self._mouse_moved = False
+
+    def _on_scroll(self, event) -> None:
+        if self._ax is None or event.inaxes is not self._ax:
+            return
+        # Zoom towards cursor
+        base_scale = 1.2
+        scale = (1 / base_scale) if event.button == 'up' else base_scale
+        xlim = list(self._ax.get_xlim())
+        ylim = list(self._ax.get_ylim())
+        xdata, ydata = event.xdata, event.ydata
+        if xdata is None or ydata is None:
+            return
+        new_w = (xlim[1] - xlim[0]) * scale
+        new_h = (ylim[1] - ylim[0]) * scale
+        relx = (xdata - xlim[0]) / (xlim[1] - xlim[0] + 1e-12)
+        rely = (ydata - ylim[0]) / (ylim[1] - ylim[0] + 1e-12)
+        self._ax.set_xlim([xdata - new_w * relx, xdata + new_w * (1 - relx)])
+        self._ax.set_ylim([ydata - new_h * rely, ydata + new_h * (1 - rely)])
+        self.canvas.draw_idle()
+
+
+class VersionsInfoPanel(QWidget):
+    """
+    Shows metadata and available versions for the selected package.
+    - Fetches version list from PyPI JSON API
+    - Color-codes items
+    - Install selected version with confirmation
+    - Emits refreshRequested after successful install
+    """
+    refreshRequested = pyqtSignal()
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.current_name: Optional[str] = None
+        self.current_version: Optional[str] = None
+        self._cache_versions: Dict[str, Tuple[List[str], Dict[str, Dict]]] = {}
+        self.proc: Optional[QProcess] = None
+
+        self.name_label = QLabel("Package: -")
+        self.version_label = QLabel("Version: -")
+        self.meta = QTextEdit()
+        self.meta.setReadOnly(True)
+
+        # Top row
+        top = QWidget()
+        th = QHBoxLayout(top)
+        th.setContentsMargins(0, 0, 0, 0)
+        th.addWidget(self.name_label)
+        th.addSpacing(12)
+        th.addWidget(self.version_label)
+        th.addStretch(1)
+
+        # Details group
+        box = QGroupBox("Details")
+        vb = QVBoxLayout(box)
+        vb.addWidget(self.meta)
+
+        # Versions group
+        self.verBox = QGroupBox("Available Versions (PyPI)")
+        ver_top = QWidget()
+        vh = QHBoxLayout(ver_top)
+        vh.setContentsMargins(0, 0, 0, 0)
+        self.btnRefresh = QPushButton("Refresh")
+        self.chkPre = QCheckBox("Include pre-releases")
+        self.chkPre.setChecked(False)
+        self.chkYanked = QCheckBox("Include yanked")
+        self.chkYanked.setChecked(False)
+        self.btnInstall = QPushButton("Install selected")
+        self.btnInstall.setEnabled(False)
+        vh.addWidget(self.btnRefresh)
+        vh.addSpacing(10)
+        vh.addWidget(self.chkPre)
+        vh.addSpacing(10)
+        vh.addWidget(self.chkYanked)
+        vh.addStretch(1)
+        vh.addWidget(self.btnInstall)
+
+        self.versionList = QListWidget()
+        self.installLog = QPlainTextEdit()
+        self.installLog.setReadOnly(True)
+        self.installLog.setPlaceholderText("Install output will appear here...")
+
+        ver_l = QVBoxLayout(self.verBox)
+        ver_l.addWidget(ver_top)
+        ver_l.addWidget(self.versionList, 2)
+        ver_l.addWidget(self.installLog, 1)
+
+        v = QVBoxLayout(self)
+        v.addWidget(top)
+        v.addWidget(box, 1)
+        v.addWidget(self.verBox, 2)
+
+        # Hooks
+        self.btnRefresh.clicked.connect(self._refetch_versions)
+        self.chkPre.toggled.connect(lambda _checked: self._populate_versions_from_cache())
+        self.chkYanked.toggled.connect(lambda _checked: self._populate_versions_from_cache())
+        self.versionList.currentItemChanged.connect(self._selection_changed)
+        self.btnInstall.clicked.connect(self._do_install)
+
+    # ---- public API ----
+    def show_package(self, name: Optional[str], version: Optional[str]) -> None:
+        self.current_name = name
+        self.current_version = version
+        if not name:
+            self.name_label.setText("Package: -")
+            self.version_label.setText("Version: -")
+            self.meta.setPlainText("")
+            self.versionList.clear()
+            self.installLog.clear()
+            self.btnInstall.setEnabled(False)
+            self.btnInstall.setToolTip("")
+            return
+        self.name_label.setText(f"Package: {name}")
+        self.version_label.setText(f"Version: {version or '-'}")
+        self._populate_metadata(name)
+        self._ensure_versions(name)
+
+    # ---- metadata ----
+    def _populate_metadata(self, name: str) -> None:
+        text = []
+        if ilm is not None:
+            for dist in ilm.distributions():  # type: ignore[attr-defined]
+                try:
+                    meta = getattr(dist, "metadata", None)
+                    dname = (meta.get("Name") if meta else None) or getattr(dist, "name", None)
+                    if canon(dname or "") != canon(name):
+                        continue
+                    if meta:
+                        for k in ("Summary", "Home-page", "Author", "License", "Requires-Python"):
+                            v = meta.get(k)
+                            if v:
+                                text.append(f"{k}: {v}")
+                    break
+                except Exception:
+                    continue
+        self.meta.setPlainText("\n".join(text) if text else "(no metadata)")
+
+    # ---- versions ----
+    def _ensure_versions(self, name: str) -> None:
+        c = canon(name)
+        if c not in self._cache_versions:
+            versions, meta = fetch_pypi_versions(name)
+            self._cache_versions[c] = (versions, meta)
+        self._populate_versions_from_cache()
+
+    def _refetch_versions(self) -> None:
+        if not self.current_name:
+            return
+        versions, meta = fetch_pypi_versions(self.current_name)
+        self._cache_versions[canon(self.current_name)] = (versions, meta)
+        self._populate_versions_from_cache()
+
+    def _populate_versions_from_cache(self) -> None:
+        self.versionList.clear()
+        name = self.current_name
+        if not name:
+            self._update_install_enabled()
+            return
+        c = canon(name)
+        tup = self._cache_versions.get(c)
+        if not tup:
+            self.versionList.addItem("(failed to fetch or no data)")
+            self._update_install_enabled()
+            return
+        versions, meta = tup
+
+        def is_pre(v: str) -> bool:
+            return bool(meta.get(v, {}).get("is_prerelease"))
+
+        def is_yanked(v: str) -> bool:
+            return bool(meta.get(v, {}).get("yanked"))
+
+        include_pre = bool(self.chkPre.isChecked())
+        include_yanked = bool(self.chkYanked.isChecked())
+
+        # Determine latest stable (non-yanked)
+        latest_stable: Optional[str] = None
+        stables = [v for v in versions if not is_pre(v) and not is_yanked(v)]
+        stables_sorted = sort_versions_desc(stables)
+        if stables_sorted:
+            latest_stable = stables_sorted[0]
+
+        # Filter shown list by toggles
+        shown = [v for v in versions if (include_pre or not is_pre(v)) and (include_yanked or not is_yanked(v))]
+        shown = sort_versions_desc(shown)
+
+        inst = (self.current_version or "").strip()
+
+        for v in shown:
+            m = meta.get(v, {})
+            tags = []
+            if v == inst:
+                tags.append("installed")
+            if v == latest_stable:
+                tags.append("latest")
+            if is_pre(v):
+                tags.append("pre")
+            if is_yanked(v):
+                tags.append("yanked")
+            tagtxt = "  [" + ", ".join(tags) + "]" if tags else ""
+            t = f"{v}{tagtxt}"
+            it = QListWidgetItem(t)
+
+            # Color rules
+            if v == inst:
+                it.setBackground(QBrush(QColor("#d9fdd3")))  # light green
+            if v == latest_stable and v != inst:
+                it.setBackground(QBrush(QColor("#d6eaff")))  # light blue
+            if is_pre(v):
+                it.setForeground(QBrush(QColor("#b26a00")))   # dark orange
+            if is_yanked(v):
+                it.setForeground(QBrush(QColor("#b00020")))   # red
+
+            # Store raw version in item data for quick access
+            it.setData(Qt.ItemDataRole.UserRole, v)
+            self.versionList.addItem(it)
+
+        self._update_install_enabled()
+
+    def _selection_changed(self, _cur, _prev) -> None:
+        self._update_install_enabled()
+
+    def _selected_version(self) -> Optional[str]:
+        it = self.versionList.currentItem()
+        if not it:
+            return None
+        v = it.data(Qt.ItemDataRole.UserRole)
+        if v:
+            return str(v)
+        # Fallback parse
+        text = it.text()
+        return text.split()[0] if text else None
+
+    def _selected_is_yanked(self) -> bool:
+        name = self.current_name
+        if not name:
+            return False
+        c = canon(name)
+        tup = self._cache_versions.get(c)
+        if not tup:
+            return False
+        _versions, meta = tup
+        v = self._selected_version()
+        if not v:
+            return False
+        return bool(meta.get(v, {}).get("yanked"))
+
+    def _update_install_enabled(self) -> None:
+        enable = False
+        tooltip = ""
+        if self.current_name and self._selected_version():
+            if self._selected_is_yanked():
+                enable = False
+                tooltip = "Cannot install a yanked version from this UI. Select a non-yanked version."
+            else:
+                enable = True
+        self.btnInstall.setEnabled(enable)
+        self.btnInstall.setToolTip(tooltip)
+
+    # ---- install ----
+    def _do_install(self) -> None:
+        if not self.current_name:
+            return
+        v = self._selected_version()
+        if not v:
+            return
+        # Prevent installing yanked version (double-check)
+        if self._selected_is_yanked():
+            QMessageBox.warning(self, "Yanked release",
+                                "This version is yanked on PyPI. Please choose a non-yanked version.")
+            self._update_install_enabled()
+            return
+        # Confirmation
+        cmd_display = f'{sys.executable} -m pip install "{self.current_name}=={v}"'
+        resp = QMessageBox.question(
+            self, "Confirm installation",
+            f"Run the following command?\n\n{cmd_display}\n\nThis may change your Python environment.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+
+        # Launch QProcess
+        self.installLog.clear()
+        self.btnInstall.setEnabled(False)
+        self.btnRefresh.setEnabled(False)
+        self.chkPre.setEnabled(False)
+        self.chkYanked.setEnabled(False)
+
+        self.proc = QProcess(self)
+        # Merge stderr into stdout for simpler capture
+        self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.proc.readyReadStandardOutput.connect(self._proc_ready)
+        self.proc.finished.connect(self._proc_finished)
+
+        self.proc.start(sys.executable, ["-m", "pip", "install", f"{self.current_name}=={v}"])
+
+    def _proc_ready(self) -> None:
+        if not self.proc:
+            return
+        data = self.proc.readAllStandardOutput().data().decode("utf-8", errors="replace")
+        if data:
+            self.installLog.appendPlainText(data.rstrip())
+
+    def _proc_finished(self, exitCode: int, exitStatus) -> None:
+        ok = (exitCode == 0)
+        self.installLog.appendPlainText(f"\n[Finished] exitCode={exitCode}")
+        QMessageBox.information(self, "Installation finished",
+                                "Success." if ok else "Failed. Check the log above.")
+        self.btnInstall.setEnabled(True)
+        self.btnRefresh.setEnabled(True)
+        self.chkPre.setEnabled(True)
+        self.chkYanked.setEnabled(True)
+        # Suggest refresh of installed list
+        if ok:
+            self.refreshRequested.emit()
+
+
+# -------------------- Main window --------------------
 
 class MainWindow(QMainWindow):
-    """Main application window."""
-
     def __init__(self) -> None:
         super().__init__()
-        self.env = detect_environment()
-        self.setWindowTitle("Pip Version Manager (PyQt6)")
-        self.resize(1160, 760)
-        self._busy = False
+        self.setWindowTitle("Pip Version Manager (with Graph)")
+        self.resize(1300, 880)
 
-        # Settings
-        self.settings = QSettings("hfuna", "PipVersionManager")
+        # Data caches
+        self.rows: List[PackageRow] = []
+        self.dep_graph: Optional["nx.DiGraph"] = None
+        self.canon_to_display: Dict[str, str] = {}
 
-        # Process + queue
-        self.proc = PipRunner(self)
-        self.proc.outputReady.connect(self._append_log)
-        self.proc.finishedOk.connect(self._on_pip_ok)
-        self.proc.finishedErr.connect(self._on_pip_err)
-        self._pending: List[Tuple[str, List[str]]] = []
-
-        # Network
-        self.nam: Optional["QNetworkAccessManager"] = None
-        if HAVE_QTNETWORK:
-            self.nam = QNetworkAccessManager(self)
-
-        # UI
         self._build_ui()
-        self._wire()
-        self._restore_settings()
-
-        QTimer.singleShot(50, self.refresh_installed)
+        self._refresh()
 
     def _build_ui(self) -> None:
         # Actions
-        self.actRefresh = QAction("Refresh", self)
-        self.actRefresh.setShortcut(QKeySequence.StandardKey.Refresh)
-        self.actInstall = QAction("Install", self)
-        self.actUninstall = QAction("Uninstall", self)
+        actRefresh = QAction("Refresh", self)
+        actRefresh.setShortcut(QKeySequence.StandardKey.Refresh)
+        actRefresh.triggered.connect(self._refresh)
 
-        # Left table
-        self.model = InstalledModel()
-        self.proxy = QSortFilterProxyModel(self)
+        self.addAction(actRefresh)
+        self.menuBar().addMenu("&Actions").addAction(actRefresh)
+
+        # Left: search + table
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Filter packages (type to search)")
+        self.search.textChanged.connect(self._apply_filter)
+
+        self.model = InstalledTableModel([])
+        self.proxy = CaseInsensitiveStableProxy(self)
         self.proxy.setSourceModel(self.model)
         self.proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self.proxy.setFilterKeyColumn(InstalledModel.COL_NAME)
+        self.proxy.setFilterKeyColumn(InstalledTableModel.COL_NAME)
 
         self.table = QTableView()
         self.table.setModel(self.proxy)
+        self.table.setSortingEnabled(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
-        self.editSearch = QLineEdit()
-        self.editSearch.setPlaceholderText("Filter packages (incremental)")
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(InstalledTableModel.COL_NAME, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(InstalledTableModel.COL_VERSION, QHeaderView.ResizeMode.ResizeToContents)
+        header.setMinimumSectionSize(220)  # prevent overly narrow columns
+        self.table.setColumnWidth(InstalledTableModel.COL_NAME, 500)
 
-        leftBox = QWidget()
-        llay = QVBoxLayout(leftBox)
-        llay.addWidget(self.editSearch)
-        llay.addWidget(self.table, 1)
+        self.table.verticalHeader().setVisible(False)
+        self.table.selectionModel().selectionChanged.connect(self._on_selection_changed)
 
-        # Right pane
-        self.lblTarget = QLabel("Versions: -")
-        self.listVersions = QListWidget()
-        self.btnInstall = QPushButton("Install")
-        self.btnInstall.setEnabled(False)
-        self.txtInfo = QTextEdit()
-        self.txtInfo.setReadOnly(True)
-        self.txtInfo.setPlaceholderText("Package info (summary / urls / requires-python)")
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.addWidget(self.search)
+        lv.addWidget(self.table, 1)
 
-        rightBox = QWidget()
-        rlay = QVBoxLayout(rightBox)
-        rlay.addWidget(self.lblTarget)
-        rlay.addWidget(self.listVersions, 2)
-        rlay.addWidget(self.txtInfo, 1)
-        rlay.addWidget(self.btnInstall)
+        # Right: tabs
+        self.infoPanel = VersionsInfoPanel(self)
+        self.infoPanel.refreshRequested.connect(self._refresh)
+        self.graphPanel = GraphPanel(self)
 
-        # Options
-        self.lblEnv = QLabel(self._format_env_label())
-        self.txtIndex = QLineEdit()
-        self.txtIndex.setPlaceholderText("Index URL (-i), e.g. https://pypi.org/simple")
-        self.txtExtra = QLineEdit()
-        self.txtExtra.setPlaceholderText("Extra index URL (--extra-index-url)")
-        self.chkPre = QCheckBox("--pre")
-        self.chkUser = QCheckBox("--user")
-        self.chkNoDeps = QCheckBox("--no-deps")
-
-        if self.env["type"] in {"virtualenv", "conda"}:
-            self.chkUser.setChecked(False)
-            self.chkUser.setEnabled(False)
-            self.chkUser.setToolTip("--user is ignored inside virtualenv/conda.")
-
-        optBox = QGroupBox("Environment & Options")
-        optLay = QHBoxLayout(optBox)
-        optLay.addWidget(self.lblEnv, 1)
-        optLay.addWidget(self.txtIndex, 2)
-        optLay.addWidget(self.txtExtra, 2)
-        optLay.addWidget(self.chkPre)
-        optLay.addWidget(self.chkUser)
-        optLay.addWidget(self.chkNoDeps)
+        tabs = QTabWidget()
+        tabs.addTab(self.infoPanel, "Versions & Info")
+        tabs.addTab(self.graphPanel, "Dependency Graph")
 
         # Splitter
         split = QSplitter()
-        split.addWidget(leftBox)
-        split.addWidget(rightBox)
-        split.setStretchFactor(0, 2)
-        split.setStretchFactor(1, 3)
+        split.addWidget(left)
+        split.addWidget(tabs)
+        split.setStretchFactor(0, 3)  # favor left
+        split.setStretchFactor(1, 4)
+        split.setSizes([780, 600])
 
-        # Log
-        self.txtLog = QTextEdit()
-        self.txtLog.setReadOnly(True)
-        self.txtLog.setPlaceholderText("pip logs will appear here")
-
-        # Central
+        # Top-level
         central = QWidget()
-        lay = QVBoxLayout(central)
-        lay.addWidget(optBox)
-        lay.addWidget(split, 1)
-        lay.addWidget(self.txtLog, 1)
+        cv = QVBoxLayout(central)
+        cv.addWidget(split, 1)
         self.setCentralWidget(central)
 
-        # Status bar
-        self.setStatusBar(QStatusBar())
+        self.statusBar().showMessage("Ready")
 
-        self.addAction(self.actRefresh)
-        self.addAction(self.actInstall)
-        self.addAction(self.actUninstall)
-
-    def _wire(self) -> None:
-        self.actRefresh.triggered.connect(self.refresh_installed)
-        self.actInstall.triggered.connect(self.install_selected)
-        self.actUninstall.triggered.connect(self.uninstall_current)
-
-        self.editSearch.textChanged.connect(self._on_filter)
-        self.table.selectionModel().selectionChanged.connect(self._on_row_selected)
-        self.table.customContextMenuRequested.connect(self._on_table_ctx)
-
-        self.listVersions.itemSelectionChanged.connect(self._on_version_selected)
-        self.btnInstall.clicked.connect(self.install_selected)
-
-    def _restore_settings(self) -> None:
-        size = self.settings.value("size", None)
-        if isinstance(size, QSize):
-            self.resize(size)
-        self.txtIndex.setText(self.settings.value("index_url", ""))
-        self.txtExtra.setText(self.settings.value("extra_index", ""))
-        self.chkPre.setChecked(self.settings.value("pre", False, type=bool))
-        self.chkNoDeps.setChecked(self.settings.value("no_deps", False, type=bool))
-
-    def closeEvent(self, e) -> None:
-        self.settings.setValue("size", self.size())
-        self.settings.setValue("index_url", self.txtIndex.text())
-        self.settings.setValue("extra_index", self.txtExtra.text())
-        self.settings.setValue("pre", self.chkPre.isChecked())
-        self.settings.setValue("no_deps", self.chkNoDeps.isChecked())
-        super().closeEvent(e)
-
-    # Helpers
-
-    def _format_env_label(self) -> str:
-        t = self.env["type"]
-        name = self.env["name"]
-        if t == "system":
-            base = "System Python"
-        elif t == "virtualenv":
-            base = f"Virtualenv ({name or 'unnamed'})"
-        else:
-            base = f"Conda ({name or 'env'})"
-        return f"{base} — {self.env['executable']}"
-
-    def _append_log(self, text: str) -> None:
-        self.txtLog.moveCursor(self.txtLog.textCursor().MoveOperation.End)
-        self.txtLog.insertPlainText(text)
-        self.txtLog.moveCursor(self.txtLog.textCursor().MoveOperation.End)
-
-    def _set_busy(self, busy: bool) -> None:
-        self._busy = busy
-        self.table.setEnabled(not busy)  # keep explicit and simple
-        self.listVersions.setEnabled(not busy)
-        self.btnInstall.setEnabled(not busy and len(self.listVersions.selectedItems()) == 1)
-        self.actInstall.setEnabled(not busy)
-        self.actUninstall.setEnabled(not busy)
-        self.actRefresh.setEnabled(not busy)
-
-    def _current_row_pkg(self) -> Optional[str]:
-        idxs = self.table.selectionModel().selectedRows(InstalledModel.COL_NAME)
-        if not idxs:
-            return None
-        src = self.proxy.mapToSource(idxs[0])
-        return self.model.item(src.row(), InstalledModel.COL_NAME).text()
-
-    def _current_installed_version(self) -> Optional[str]:
-        idxs = self.table.selectionModel().selectedRows(InstalledModel.COL_VER)
-        if not idxs:
-            return None
-        src = self.proxy.mapToSource(idxs[0])
-        return self.model.item(src.row(), InstalledModel.COL_VER).text()
-
-    def _last_pip_cmd_text(self) -> Optional[str]:
-        for line in reversed(self.txtLog.toPlainText().splitlines()):
-            if line.startswith("$ ") and " -m pip " in line:
-                return line.split(" -m pip ", 1)[1]
-        return None
-
-    # Actions
-
-    def _extract_pkg_from_index_cmd(self, last: str) -> str:
-        """Return the package name from a command like 'index versions <pkg> [flags...]'."""
-        try:
-            toks = shlex.split(last)
-        except Exception:
-            toks = last.split()
-        if len(toks) >= 3 and toks[0] == "index" and toks[1] == "versions":
-            return toks[2]
-        return self._current_row_pkg() or ""
-    def refresh_installed(self) -> None:
-        if self._busy:
-            self._pending.append(("list", []))
-            return
-        args = ["list", "--format=json", "--disable-pip-version-check", "--no-color"]
-        self._log_cmd(args)
-        self._set_busy(True)
-        self.proc.run(args)
-
-    def request_versions(self, pkg: str) -> None:
-        if self._busy:
-            self._pending.append(("versions", [pkg]))
-            return
-        args = ["index", "versions", pkg, "--disable-pip-version-check", "--no-color"]
-        if self.txtIndex.text().strip():
-            args += ["-i", self.txtIndex.text().strip()]
-        if self.txtExtra.text().strip():
-            args += ["--extra-index-url", self.txtExtra.text().strip()]
-        self._log_cmd(args)
-        self._set_busy(True)
-        self.proc.run(args)
-
-    def install_selected(self) -> None:
-        pkg = self._current_row_pkg()
-        if not pkg:
-            return
-        items = self.listVersions.selectedItems()
-        if not items:
-            return
-        target = items[0].data(Qt.ItemDataRole.UserRole)
-        if not target:
-            return
-        args = ["install", f"{pkg}=={target}", "--disable-pip-version-check", "--no-color"]
-        if self.chkNoDeps.isChecked():
-            args.append("--no-deps")
-        if self.chkPre.isChecked():
-            args.append("--pre")
-        if self.chkUser.isEnabled() and self.chkUser.isChecked():
-            args.append("--user")
-        if self.txtIndex.text().strip():
-            args += ["-i", self.txtIndex.text().strip()]
-        if self.txtExtra.text().strip():
-            args += ["--extra-index-url", self.txtExtra.text().strip()]
-        self._log_cmd(args)
-        self._set_busy(True)
-        self.proc.run(args)
-
-    def uninstall_current(self) -> None:
-        pkg = self._current_row_pkg()
-        if not pkg:
-            return
-        args = ["uninstall", "-y", pkg, "--disable-pip-version-check", "--no-color"]
-        self._log_cmd(args)
-        self._set_busy(True)
-        self.proc.run(args)
-
-    # Results
-
-    def _on_pip_ok(self, _code: int, text: str) -> None:
-        self._set_busy(False)
-        last = self._last_pip_cmd_text() or ""
-        if last.startswith("list "):
-            try:
-                data = json.loads(text) if text.strip() else []
-            except json.JSONDecodeError:
-                block = extract_json_array(text or "")
-                if block:
-                    try:
-                        data = json.loads(block)
-                    except Exception:
-                        data = []
-                else:
-                    data = []
-            pkgs = [Package(d.get("name", ""), d.get("version", "")) for d in data if isinstance(d, dict) and d.get("name")]
-            if not pkgs:
-                self._append_log("pip list produced no JSON data; using importlib.metadata fallback...\n")
-                pkgs = _collect_installed_importlib()
-            self.model.set_packages(pkgs)
-            self.proxy.sort(InstalledModel.COL_NAME, Qt.SortOrder.AscendingOrder)
-            self.statusBar().showMessage(f"Loaded {len(pkgs)} packages — {self._format_env_label()}", 5000)
-            self._drain_queue()
-            return
-        if last.startswith("index versions "):
-            pkg = self._extract_pkg_from_index_cmd(last)
-            self._handle_versions_text(pkg, text)
-            self._drain_queue()
-            return
-        if last.startswith("install "):
-            self._append_log("\n✅ Install finished.\n")
-            self.refresh_installed()
-            self._drain_queue()
-            return
-        if last.startswith("uninstall "):
-            self._append_log("\n✅ Uninstall finished.\n")
-            self.refresh_installed()
-            self._drain_queue()
-            return
-        self._drain_queue()
-
-    def _on_pip_err(self, _code: int, text: str) -> None:
-        self._set_busy(False)
-        self._append_log("\n❌ pip exited with non-zero status\n")
-        last = self._last_pip_cmd_text() or ""
-        if last.startswith("index versions "):
-            pkg = self._extract_pkg_from_index_cmd(last)
-            self._append_log("Falling back to PyPI JSON API…\n")
-            self._fetch_versions_json(pkg)
-        elif last.startswith("list "):
-            self._append_log("Falling back to importlib.metadata to enumerate packages…\n")
-            pkgs = _collect_installed_importlib()
-            if pkgs:
-                self.model.set_packages(pkgs)
-                self.proxy.sort(InstalledModel.COL_NAME, Qt.SortOrder.AscendingOrder)
-                self.statusBar().showMessage(f"Loaded {len(pkgs)} packages via importlib.metadata — {self._format_env_label()}", 5000)
-        elif last.startswith("install ") and "==999999999" in last:
-            # Parse versions from pip's error ("from versions: ...")
-            text_no_ansi = _strip_ansi(text)
-            m1 = re.search(r"from versions:\s*([^\n]+)", text_no_ansi, re.IGNORECASE)
-            if not m1:
-                m1 = re.search(r"available\s+versions?\s*:\s*(.+)$", text_no_ansi, re.IGNORECASE | re.MULTILINE)
-            versions = []
-            if m1:
-                tail = m1.group(1)
-                versions = [t.strip() for t in re.split(r"[,\\s]+", tail) if t.strip()]
-            if versions:
-                try:
-                    pkg = re.search(r"install\s+([^=\s]+)==999999999", last).group(1)
-                except Exception:
-                    pkg = self._current_row_pkg() or "(unknown)"
-                self._append_log(f"Recovered {len(versions)} versions via probe.\n")
-                self._populate_version_list(pkg, versions)
-            else:
-                self._append_log("Could not recover versions via probe.\n")
-        self._drain_queue()
-
-    # Versions pipeline
-
-    def _handle_versions_text(self, pkg: str, text: str) -> None:
-        versions = self._parse_versions_from_pip_index(text)
-        if not versions:
-            self._append_log("Could not parse `pip index versions` output; trying PyPI JSON…\n")
-            self._fetch_versions_json(pkg)
-            # Queue probe as last resort
-            self._pending.append(("_probe", [pkg]))
-            return
-        self._populate_version_list(pkg, versions)
-        self._fetch_info_json(pkg)
-
-    @staticmethod
-    def _parse_versions_from_pip_index(text: str) -> List[str]:
-        versions: List[str] = []
-        m = re.search(r"(?im)available\s+versions?\s*:\s*(.+)$", text)
-        if m:
-            tail = m.group(1)
-            versions = [t.strip() for t in re.split(r"[,\s]+", tail) if t.strip()]
-        if not versions:
-            versions = re.findall(r"\b\d+(?:\.[A-Za-z0-9]+)*\b", text)
-        return versions
-
-    # Networking (PyPI JSON)
-
-    def _fetch_versions_json(self, pkg: str) -> None:
-        if HAVE_QTNETWORK and self.nam is not None:
-            url = QUrl(f"https://pypi.org/pypi/{pkg}/json")
-            req = QNetworkRequest(url)
-            req.setHeader(QNetworkRequest.KnownHeaders.UserAgentHeader, "PipVersionManager/1.0")
-            reply = self.nam.get(req)
-            reply.finished.connect(lambda r=reply, p=pkg: self._on_versions_reply(p, r))
-            return
-        # No QtNetwork: do nothing here; probe will handle
-
-    def _fetch_info_json(self, pkg: str) -> None:
-        if HAVE_QTNETWORK and self.nam is not None:
-            url = QUrl(f"https://pypi.org/pypi/{pkg}/json")
-            req = QNetworkRequest(url)
-            req.setHeader(QNetworkRequest.KnownHeaders.UserAgentHeader, "PipVersionManager/1.0")
-            reply = self.nam.get(req)
-            reply.finished.connect(lambda r=reply: self._on_info_reply(r))
-
-    def _on_versions_reply(self, pkg: str, reply: "QNetworkReply") -> None:
-        if reply.error() != QNetworkReply.NetworkError.NoError:
-            self._append_log(f"Network error: {reply.errorString()}\n")
-            self._probe_versions_via_pip_install(pkg)
-            reply.deleteLater()
-            return
-        try:
-            data = json.loads(bytes(reply.readAll()).decode())
-            releases = list(data.get("releases", {}).keys())
-            if not releases:
-                self._append_log("PyPI JSON returned no releases; probing via pip…\n")
-                self._probe_versions_via_pip_install(pkg)
-                reply.deleteLater()
-                return
-            versions = sorted(releases, key=version_key, reverse=True)
-            self._populate_version_list(pkg, versions)
-            self._populate_info_from_json(data)
-        except Exception as e:
-            self._append_log(f"Failed to parse PyPI JSON: {e}\n")
-        finally:
-            reply.deleteLater()
-
-    def _on_info_reply(self, reply: "QNetworkReply") -> None:
-        if reply.error() != QNetworkReply.NetworkError.NoError:
-            self._append_log(f"Network error: {reply.errorString()}\n")
-            reply.deleteLater()
-            return
-        try:
-            data = json.loads(bytes(reply.readAll()).decode())
-            self._populate_info_from_json(data)
-        except Exception as e:
-            self._append_log(f"Failed to parse PyPI JSON: {e}\n")
-        finally:
-            reply.deleteLater()
-
-    def _populate_info_from_json(self, data: dict) -> None:
-        info = data.get("info", {}) if isinstance(data, dict) else {}
-        name = info.get("name") or ""
-        summary = info.get("summary") or ""
-        home = info.get("home_page") or ""
-        rp = info.get("requires_python") or ""
-        license_ = info.get("license") or ""
-        proj_urls = info.get("project_urls") or {}
-
-        lines = []
-        if name:
-            lines.append(f"**{name}**")
-        if summary:
-            lines.append(summary)
-        if rp:
-            lines.append(f"Requires-Python: {rp}")
-        if license_:
-            lines.append(f"License: {license_}")
-        if home:
-            lines.append(f"Home: {home}")
-        if isinstance(proj_urls, dict) and proj_urls:
-            lines.append("Project URLs: " + ", ".join(f"{k}: {v}" for k, v in proj_urls.items()))
-        self.txtInfo.setPlainText("\n".join(lines) if lines else "(no metadata)")
-
-    # Probe fallback
-
-    def _probe_versions_via_pip_install(self, pkg: str) -> None:
-        if self._busy:
-            self._pending.append(("_probe", [pkg]))
-            return
-        args = ["install", f"{pkg}==999999999", "--disable-pip-version-check", "--no-color", "--no-deps"]
-        if self.chkPre.isChecked():
-            args.append("--pre")
-        if self.txtIndex.text().strip():
-            args += ["-i", self.txtIndex.text().strip()]
-        if self.txtExtra.text().strip():
-            args += ["--extra-index-url", self.txtExtra.text().strip()]
-        self._append_log("Probing versions via pip install failure trick...\n")
-        self._log_cmd(args)
-        self._set_busy(True)
-        self.proc.run(args)
-
-    # Rendering
-
-    def _populate_version_list(self, pkg: str, versions: List[str]) -> None:
-        self.lblTarget.setText(f"Versions: {pkg}")
-        if not self.chkPre.isChecked():
-            versions = [v for v in versions if not is_prerelease(v)]
-        versions = sorted(set(versions), key=version_key, reverse=True)
-
-        cur = self._current_installed_version()
-        cur_triplet = parse_semver_triplet(cur)
-
-        self.listVersions.clear()
-        for v in versions:
-            item = QListWidgetItem(v)
-            item.setData(Qt.ItemDataRole.UserRole, v)
-            if cur and v != cur:
-                v_triplet = parse_semver_triplet(v)
-                color: Optional[QColor] = None
-                if v_triplet[0] is not None and cur_triplet[0] is not None and v_triplet[0] != cur_triplet[0]:
-                    color = QColor(Qt.GlobalColor.red)
-                elif v_triplet[1] is not None and cur_triplet[1] is not None and v_triplet[1] != cur_triplet[1]:
-                    color = QColor(Qt.GlobalColor.darkYellow)
-                elif v_triplet[2] is not None and cur_triplet[2] is not None and v_triplet[2] != cur_triplet[2]:
-                    color = QColor(Qt.GlobalColor.blue)
-                if color is not None:
-                    item.setForeground(QBrush(color))
-            else:
-                item.setText(f"{v}  ✓ current")
-                f = item.font()
-                f.setBold(True)
-                item.setFont(f)
-            self.listVersions.addItem(item)
-
-        # Preselect current version if present
-        if cur:
-            matches = self.listVersions.findItems(cur, Qt.MatchFlag.MatchStartsWith)
-            if matches:
-                self.listVersions.setCurrentItem(matches[0])
-        self._update_install_button_label()
-
-    def _update_install_button_label(self) -> None:
-        items = self.listVersions.selectedItems()
-        cur = self._current_installed_version()
-        if not items:
-            self.btnInstall.setText("Install")
-            self.btnInstall.setEnabled(False)
-            return
-        v = items[0].data(Qt.ItemDataRole.UserRole) or ""
-        if cur and v == cur:
-            self.btnInstall.setText("Already installed")
-            self.btnInstall.setEnabled(False)
-        else:
-            if cur:
-                verb = "Upgrade" if version_key(v) > version_key(cur) else "Downgrade"
-            else:
-                verb = "Install"
-            self.btnInstall.setText(f"{verb} to {v}")
-            self.btnInstall.setEnabled(not self._busy)
-
-    # UI slots
-
-    def _on_filter(self, text: str) -> None:
+    def _apply_filter(self, text: str) -> None:
         self.proxy.setFilterFixedString(text)
 
-    def _on_row_selected(self, _sel: QItemSelection, _desel: QItemSelection) -> None:
-        pkg = self._current_row_pkg()
-        if not pkg:
-            self.lblTarget.setText("Versions: -")
-            self.listVersions.clear()
-            self.txtInfo.clear()
+    def _refresh(self) -> None:
+        self.statusBar().showMessage("Refreshing...")
+        self.rows = list_installed_packages()
+        self.model.set_rows(self.rows)
+        # Initial sort: Package name A→Z, case-insensitive, stable
+        try:
+            hdr = self.table.horizontalHeader()
+            hdr.setSortIndicator(InstalledTableModel.COL_NAME, Qt.SortOrder.AscendingOrder)
+            hdr.setSortIndicatorShown(True)
+            self.table.sortByColumn(InstalledTableModel.COL_NAME, Qt.SortOrder.AscendingOrder)
+        except Exception:
+            try:
+                self.proxy.sort(InstalledTableModel.COL_NAME, Qt.SortOrder.AscendingOrder)
+            except Exception:
+                pass
+        self.statusBar().showMessage(f"Found {len(self.rows)} packages")
+
+        # Build dependency graph
+        G, c2d = build_dependency_graph(self.rows)
+        self.dep_graph = G
+        self.canon_to_display = c2d
+        if G is not None:
+            self.graphPanel.set_dataset(G, c2d)
+
+        self.infoPanel.show_package(None, None)
+
+    def _on_selection_changed(self) -> None:
+        idxs = self.table.selectionModel().selectedRows()
+        if not idxs:
+            self.infoPanel.show_package(None, None)
+            if self.dep_graph is not None:
+                self.graphPanel.set_focus(None)
             return
-        self.request_versions(pkg)
-        self._fetch_info_json(pkg)
-
-    def _on_version_selected(self) -> None:
-        self._update_install_button_label()
-
-    def _on_table_ctx(self, pos) -> None:
-        idx = self.table.indexAt(pos)
-        if not idx.isValid():
+        row = self.model.row_at(idxs[0], self.proxy)
+        if not row:
             return
-        src = self.proxy.mapToSource(idx)
-        pkg = self.model.item(src.row(), InstalledModel.COL_NAME).text()
-        menu = QMenu(self)
-        actCopy = QAction("Copy name", self)
-        actShow = QAction("Show versions", self)
-        actCopy.triggered.connect(lambda: QApplication.clipboard().setText(pkg))
-        actShow.triggered.connect(lambda: self.request_versions(pkg))
-        menu.addAction(actCopy)
-        menu.addAction(actShow)
-        menu.exec(self.table.viewport().mapToGlobal(pos))
-
-    # Logging
-
-    def _log_cmd(self, args: List[str]) -> None:
-        quoted = " ".join(repr(a) if " " in a else a for a in args)
-        self._append_log(f"$ {sys.executable} -m pip {quoted}\n")
-
-    # Queue
-
-    def _drain_queue(self) -> None:
-        if self._busy or not self._pending:
-            return
-        label, args = self._pending.pop(0)
-        if label == "list":
-            self.refresh_installed()
-        elif label == "versions":
-            self.request_versions(args[0])
-        elif label == "_probe":
-            self._probe_versions_via_pip_install(args[0])
+        self.infoPanel.show_package(row.name, row.version)
+        if self.dep_graph is not None:
+            self.graphPanel.set_focus(canon(row.name))
 
 
-def main() -> None:
+# -------------------- Entry point --------------------
+
+def main() -> int:
     app = QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
-    sys.exit(app.exec())
-
+    w = MainWindow()
+    w.show()
+    return app.exec()
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
