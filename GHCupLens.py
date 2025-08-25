@@ -531,7 +531,7 @@ class MainWindow(QMainWindow):
             if ("set" in low) or ("default" in low):
                 item.setBackground(QBrush(QColor("#dbeafe")))  # light blue
             elif "installed" in low:
-                item.setBackground(QBrush(QColor("#dcfce7")))  # light green
+                item.setBackground(QBrush(QColor("#cce2cb")))  # light green
             self.versionsList.addItem(item)
 
         if self.versionsList.count() > 0:
