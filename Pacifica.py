@@ -229,6 +229,9 @@ class AptManager(QtWidgets.QWidget):
         if self.proc.state() != QtCore.QProcess.ProcessState.NotRunning:
             return
         self.log.clear()
+        self.append_log(">> Running: sudo apt-get update")
+        self._progress_busy("Fetching package indexes...")
+        self._sudo_run(["apt-get", "update"])
         self.append_log(">> Running: apt list --upgradable")
         env = QtCore.QProcessEnvironment.systemEnvironment()
         env.insert("LC_ALL", "C")
