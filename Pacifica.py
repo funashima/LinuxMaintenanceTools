@@ -231,14 +231,27 @@ class AptManager(QtWidgets.QWidget):
         self.log.clear()
         self.append_log(">> Running: sudo apt-get update")
         self._progress_busy("Fetching package indexes...")
-        self._sudo_run(["apt-get", "update"])
-        self.append_log(">> Running: apt list --upgradable")
-        env = QtCore.QProcessEnvironment.systemEnvironment()
-        env.insert("LC_ALL", "C")
-        self.proc.setProcessEnvironment(env)
-        self._start_process(["bash", "-lc", "apt list --upgradable 2>/dev/null"],
-                            on_finish=self._populate_table_from_list)
 
+        # Chain: after update finishes, then run apt list --upgradable
+        def _after_update(exitCode, exitStatus):
+            # one-shot disconnect to avoid multiple triggers
+            try:
+                self.proc.finished.disconnect(_after_update)
+            except TypeError:
+                pass
+
+            # check sudo outcome (wrong password / not sudoers, etc.)
+            self._check_sudo_result(["apt-get", "update"])
+
+            self.append_log(">> Running: apt list --upgradable")
+            env = QtCore.QProcessEnvironment.systemEnvironment()
+            env.insert("LC_ALL", "C")
+            self.proc.setProcessEnvironment(env)
+            self._start_process(["bash", "-lc", "apt list --upgradable 2>/dev/null"],
+                                on_finish=self._populate_table_from_list)
+
+        self.proc.finished.connect(_after_update)
+        self._sudo_run(["apt-get", "update"])
     def upgrade_selected(self):
         if self.proc.state() != QtCore.QProcess.ProcessState.NotRunning:
             return
