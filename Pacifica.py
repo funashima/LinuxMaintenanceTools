@@ -4,21 +4,10 @@
 """
 Simple APT Manager (PyQt6) — sudo prompt, version color highlighting, and progress bars
 
-Features:
-- Buttons: "apt update", "apt list --upgradable", "Upgrade Selected", "Select All", "Clear All"
-- Table columns: Select / Package / Current Version / Candidate Version / Arch / Origin
-- Always prompts for sudo password before privileged ops (update, upgrade selected)
-- Optional in-session password remember
-- Highlights Current/Candidate cells by version difference level:
-    Major -> light red (#ffe5e5)
-    Minor -> light orange (#fff0e0)
-    Patch -> light blue (#e7f0ff)
-- Progress bar:
-    * During `apt update`: indeterminate (busy) indicator
-    * During upgrades: coarse % based on "Unpacking" + "Setting up" log lines per package
-
-Run:
-  python3 apt_manager.py
+Modifications:
+- On startup, automatically run "apt list --upgradable" flow (i.e. sudo apt-get update -> apt list ...)
+- Added a checkbox "Refresh list after upgrade" (default: ON). If checked, after successful upgrade it re-runs the list.
+- All apt-related commands (update / upgrade / list) are run with LC_ALL=C (and LANG=C) so that parsing is stable.
 """
 
 import sys
@@ -42,6 +31,7 @@ APT_LIST_PATTERN = re.compile(
 # --- Version comparison helpers (SemVer-like extraction from Debian-ish versions) ---
 SEMVER_NUM = re.compile(r"(\d+)")
 
+
 def _semver_parts(ver: str):
     """Extract up to three integer parts (major, minor, patch) from a Debian-like version.
     - Drop epoch (X:...)
@@ -57,6 +47,7 @@ def _semver_parts(ver: str):
         nums.append(0)
     return nums[:3]
 
+
 def version_diff_level(current: str, candidate: str) -> str:
     """Classify diff as 'major' / 'minor' / 'patch' / 'same' based on first differing part."""
     a = _semver_parts(current)
@@ -68,6 +59,7 @@ def version_diff_level(current: str, candidate: str) -> str:
     if a[1] != b[1]:
         return "minor"
     return "patch"
+
 
 # --------------------------
 # Sudo password dialog
@@ -127,6 +119,7 @@ class PasswordDialog(QtWidgets.QDialog):
         self.lbl_error.setText(msg)
         self.lbl_error.setVisible(True)
 
+
 # --------------------------
 # Main window
 # --------------------------
@@ -134,7 +127,7 @@ class AptManager(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Simple APT Manager")
-        self.resize(1000, 760)
+        self.resize(1000, 780)
 
         # Buttons
         self.btn_update = QtWidgets.QPushButton("apt update")
@@ -142,6 +135,10 @@ class AptManager(QtWidgets.QWidget):
         self.btn_upgrade_selected = QtWidgets.QPushButton("Upgrade Selected")
         self.btn_select_all = QtWidgets.QPushButton("Select All")
         self.btn_clear_all = QtWidgets.QPushButton("Clear All")
+
+        # NEW: refresh-after-upgrade checkbox
+        self.chk_refresh_after_upgrade = QtWidgets.QCheckBox("Refresh list after upgrade")
+        self.chk_refresh_after_upgrade.setChecked(True)
 
         # Table
         self.table = QtWidgets.QTableWidget(0, 6)
@@ -157,7 +154,7 @@ class AptManager(QtWidgets.QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
 
-        # Progress bar (top of the log)
+        # Progress bar
         self.progress = QtWidgets.QProgressBar()
         self.progress.setTextVisible(True)
         self.progress.setMinimum(0)
@@ -175,6 +172,9 @@ class AptManager(QtWidgets.QWidget):
         top_bar.addWidget(self.btn_list)
         top_bar.addSpacing(16)
         top_bar.addWidget(self.btn_upgrade_selected)
+        top_bar.addSpacing(16)
+        # put the new checkbox here
+        top_bar.addWidget(self.chk_refresh_after_upgrade)
         top_bar.addStretch(1)
         top_bar.addWidget(self.btn_select_all)
         top_bar.addWidget(self.btn_clear_all)
@@ -185,17 +185,17 @@ class AptManager(QtWidgets.QWidget):
         vbox.addWidget(self.progress, stretch=0)
         vbox.addWidget(self.log, stretch=1)
 
-        # QProcess used for apt/dpkg commands
+        # QProcess
         self.proc = QtCore.QProcess(self)
         self.proc.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.MergedChannels)
         self.proc.readyReadStandardOutput.connect(self._on_proc_output)
         self.proc.finished.connect(self._on_proc_finished)
 
-        # Password cache (in-memory for this session only)
+        # Password cache
         self._session_pw_cache: Optional[bytes] = None
         self._sudo_password_bytes: Optional[bytes] = None
 
-        # Callback after a non-list command finishes
+        # Callback after process
         self._pending_on_finish = None
 
         # Progress state
@@ -204,7 +204,6 @@ class AptManager(QtWidgets.QWidget):
         self._progress_done = 0
         self._seen_unpack = set()
         self._seen_setup = set()
-        # Row shading color for unchecked items (slightly dark gray)
         self._unchecked_bg = QtGui.QColor("#e0e0e0")
 
         # Wire buttons
@@ -213,6 +212,10 @@ class AptManager(QtWidgets.QWidget):
         self.btn_upgrade_selected.clicked.connect(self.upgrade_selected)
         self.btn_select_all.clicked.connect(self.select_all)
         self.btn_clear_all.clicked.connect(self.clear_all)
+
+        # NEW: run list on startup
+        # (use singleShot so that the window shows first)
+        QtCore.QTimer.singleShot(0, self.run_apt_list_upgradable)
 
     # --------------------------
     # Button slots
@@ -223,6 +226,7 @@ class AptManager(QtWidgets.QWidget):
         self.log.clear()
         self.append_log(">> Running: sudo apt-get update")
         self._progress_busy("Fetching package indexes...")
+        # LC_ALL etc. will be set in _start_process
         self._sudo_run(["apt-get", "update"])
 
     def run_apt_list_upgradable(self):
@@ -234,24 +238,28 @@ class AptManager(QtWidgets.QWidget):
 
         # Chain: after update finishes, then run apt list --upgradable
         def _after_update(exitCode, exitStatus):
-            # one-shot disconnect to avoid multiple triggers
+            # one-shot disconnect
             try:
                 self.proc.finished.disconnect(_after_update)
             except TypeError:
                 pass
 
-            # check sudo outcome (wrong password / not sudoers, etc.)
+            # check sudo outcome
             self._check_sudo_result(["apt-get", "update"])
 
             self.append_log(">> Running: apt list --upgradable")
+            # env with LC_ALL=C is already set in _start_process, but
+            # we can enforce here too for clarity
             env = QtCore.QProcessEnvironment.systemEnvironment()
             env.insert("LC_ALL", "C")
+            env.insert("LANG", "C")
             self.proc.setProcessEnvironment(env)
             self._start_process(["bash", "-lc", "apt list --upgradable 2>/dev/null"],
                                 on_finish=self._populate_table_from_list)
 
         self.proc.finished.connect(_after_update)
         self._sudo_run(["apt-get", "update"])
+
     def upgrade_selected(self):
         if self.proc.state() != QtCore.QProcess.ProcessState.NotRunning:
             return
@@ -262,7 +270,16 @@ class AptManager(QtWidgets.QWidget):
         self.log.clear()
         self.append_log(">> Running: sudo apt-get install --only-upgrade -y <selected>")
         self._progress_start_upgrade(packages)
-        self._sudo_run(["apt-get", "install", "--only-upgrade", "-y"] + packages)
+
+        # after upgrade: check sudo result, then (optionally) refresh list
+        def _after_upgrade():
+            self._check_sudo_result(["apt-get", "install", "--only-upgrade", "-y"] + packages)
+            if self.chk_refresh_after_upgrade.isChecked():
+                # run the whole (e) flow again
+                self.run_apt_list_upgradable()
+
+        self._sudo_run(["apt-get", "install", "--only-upgrade", "-y"] + packages,
+                       on_finish=_after_upgrade)
 
     def select_all(self):
         for row in range(self.table.rowCount()):
@@ -286,14 +303,10 @@ class AptManager(QtWidgets.QWidget):
     # Row shading helper
     # --------------------------
     def _shade_row(self, row: int, checked: bool):
-        """Shade the entire row gray when unchecked; restore colors when checked."""
-        # Column 0 is a QWidget (checkbox); 1..5 are QTableWidgetItems
-        # Shade checkbox cell background via stylesheet
         w = self.table.cellWidget(row, 0)
         if isinstance(w, QtWidgets.QWidget):
             w.setStyleSheet("") if checked else w.setStyleSheet(f"background: {self._unchecked_bg.name()};")
 
-        # Package name
         it_pkg = self.table.item(row, 1)
         it_cur = self.table.item(row, 2)
         it_cand = self.table.item(row, 3)
@@ -309,12 +322,10 @@ class AptManager(QtWidgets.QWidget):
                 it.setBackground(self._unchecked_bg)
             return
 
-        # Restore original coloring for checked rows
-        # Clear non-version cells
+        # restore coloring
         it_pkg.setBackground(QtGui.QBrush())
         it_arch.setBackground(QtGui.QBrush())
         it_origin.setBackground(QtGui.QBrush())
-        # Re-apply version diff coloring
         cur = it_cur.text()
         cand = it_cand.text()
         lvl = version_diff_level(cur, cand)
@@ -338,9 +349,18 @@ class AptManager(QtWidgets.QWidget):
     # Process helpers
     # --------------------------
     def _start_process(self, args: List[str], on_finish=None):
-        """Start process with given args; connect finish callback."""
+        """Start process with given args; connect finish callback.
+        Here we *always* set LC_ALL=C / LANG=C to make apt output stable.
+        """
         self._pending_on_finish = on_finish
         self._set_controls_enabled(False)
+
+        # enforce C locale on every process
+        env = QtCore.QProcessEnvironment.systemEnvironment()
+        env.insert("LC_ALL", "C")
+        env.insert("LANG", "C")
+        self.proc.setProcessEnvironment(env)
+
         self.proc.setProgram(args[0])
         self.proc.setArguments(args[1:])
         self.proc.start()
@@ -351,30 +371,40 @@ class AptManager(QtWidgets.QWidget):
         self.btn_upgrade_selected.setEnabled(ok)
         self.btn_select_all.setEnabled(ok)
         self.btn_clear_all.setEnabled(ok)
+        self.chk_refresh_after_upgrade.setEnabled(ok)
 
-    def _sudo_run(self, cmd_parts: List[str]):
-        """Prepare `sudo -S` command and prompt for password if needed."""
+    def _sudo_run(self, cmd_parts: List[str], on_finish=None):
+        """Prepare `sudo -S` command and prompt for password if needed.
+        on_finish: optional callback to run *after* we check the sudo result.
+        """
         if self._session_pw_cache:
             self._sudo_password_bytes = self._session_pw_cache
-            self._start_sudo_with_password(cmd_parts)
+            self._start_sudo_with_password(cmd_parts, on_finish=on_finish)
             return
-        self._prompt_password_then(lambda pw_bytes, remember: self._maybe_run_sudo(cmd_parts, pw_bytes, remember))
+        self._prompt_password_then(lambda pw_bytes, remember: self._maybe_run_sudo(cmd_parts, pw_bytes, remember, on_finish))
 
-    def _maybe_run_sudo(self, cmd_parts: List[str], pw_bytes: Optional[bytes], remember: bool):
+    def _maybe_run_sudo(self, cmd_parts: List[str], pw_bytes: Optional[bytes], remember: bool, on_finish):
         if not pw_bytes:
             return
         self._sudo_password_bytes = pw_bytes
         if remember:
             self._session_pw_cache = pw_bytes
-        self._start_sudo_with_password(cmd_parts)
+        self._start_sudo_with_password(cmd_parts, on_finish=on_finish)
 
-    def _start_sudo_with_password(self, cmd_parts: List[str]):
+    def _start_sudo_with_password(self, cmd_parts: List[str], on_finish=None):
         """Run sudo directly via QProcess and feed the password on stdin."""
         program = "sudo"
         args = ["-S", "--"] + cmd_parts
-        self._start_process([program] + args, on_finish=lambda: self._check_sudo_result(cmd_parts))
+
+        # wrap finish: first check sudo, then user-callback
+        def _wrapped_finish():
+            self._check_sudo_result(cmd_parts)
+            if on_finish:
+                on_finish()
+
+        self._start_process([program] + args, on_finish=_wrapped_finish)
         if self._sudo_password_bytes:
-            self.proc.write(self._sudo_password_bytes + b"\n")  # sudo expects newline-terminated password
+            self.proc.write(self._sudo_password_bytes + b"\n")
 
     def _prompt_password_then(self, cont):
         dlg = PasswordDialog(self)
@@ -386,7 +416,6 @@ class AptManager(QtWidgets.QWidget):
                 dlg.set_error("Password cannot be empty.")
 
     def _check_sudo_result(self, cmd_parts: List[str]):
-        """Inspect output to detect wrong password; if so, re-prompt."""
         text = self.log.toPlainText()
         wrong_pw = any(s in text for s in [
             "Sorry, try again.",
@@ -402,10 +431,8 @@ class AptManager(QtWidgets.QWidget):
             return
 
         if wrong_pw:
-            # Clear any cached wrong password
             self._session_pw_cache = None
             self._sudo_password_bytes = None
-            # Re-prompt
             self.append_log(">> Incorrect password. Please try again.")
             self._prompt_password_then(lambda pw_bytes, remember: self._retry_sudo(cmd_parts, pw_bytes, remember))
 
@@ -430,12 +457,12 @@ class AptManager(QtWidgets.QWidget):
 
     def _progress_busy(self, msg: str):
         self._progress_mode = "busy"
-        self.progress.setRange(0, 0)  # 0,0 shows indeterminate busy indicator
+        self.progress.setRange(0, 0)
         self.progress.setFormat(msg)
 
     def _progress_start_upgrade(self, pkgs: List[str]):
         self._progress_mode = "upgrade"
-        self._progress_total = max(1, 2 * len(pkgs))  # Unpack + Setup per package
+        self._progress_total = max(1, 2 * len(pkgs))
         self._progress_done = 0
         self._seen_unpack.clear()
         self._seen_setup.clear()
@@ -464,7 +491,7 @@ class AptManager(QtWidgets.QWidget):
         if data:
             self.append_log(data)
 
-            # Optional: if sudo prompts again, re-feed the password once
+            # if sudo prompts again
             if "sudo" in data.lower() and "password" in data.lower():
                 if self._sudo_password_bytes:
                     try:
@@ -472,32 +499,25 @@ class AptManager(QtWidgets.QWidget):
                     except Exception:
                         pass
 
-            # Progress detection while upgrading (coarse but user-friendly)
+            # progress from dpkg/apt
             if self._progress_mode == "upgrade":
                 for line in data.splitlines():
                     s = line.strip()
                     low = s.lower()
-                    # Typical dpkg/apt lines:
-                    #   "Unpacking <pkg> ..." or "Unpacking <pkg> (ver) over ..."
-                    #   "Setting up <pkg> (ver) ..."
-                    #   "Processing triggers for <pkg> ..."
                     if low.startswith("unpacking "):
                         parts = s.split()
                         if len(parts) >= 2:
                             self._progress_tick("unpack", parts[1])
                     elif low.startswith("setting up "):
                         parts = s.split()
-                        # parts[2] is the package when the line is exactly "Setting up <pkg> ..."
                         if len(parts) >= 3:
                             self._progress_tick("setup", parts[2] if parts[1] == "up" else parts[1])
                     elif low.startswith("processing triggers for "):
-                        # Nudge forward a little; not strictly tied to a package phase
                         self._progress_done = min(self._progress_done + 1, self._progress_total)
                         self.progress.setValue(self._progress_done)
 
     def _on_proc_finished(self, exit_code: int, exit_status: QtCore.QProcess.ExitStatus):
         self._set_controls_enabled(True)
-        # Make the progress bar show completion, then reset
         if self._progress_mode in ("busy", "upgrade"):
             self.progress.setRange(0, 1)
             self.progress.setValue(1)
@@ -539,7 +559,7 @@ class AptManager(QtWidgets.QWidget):
 
         self.table.setRowCount(len(entries))
         for row, (pkg, current, candidate, arch, origin) in enumerate(entries):
-            # Checkbox in column 0
+            # Checkbox
             chk = QtWidgets.QCheckBox()
             chk.setChecked(True)
             chk_widget = QtWidgets.QWidget()
@@ -548,19 +568,15 @@ class AptManager(QtWidgets.QWidget):
             layout.addWidget(chk)
             layout.addStretch(1)
             self.table.setCellWidget(row, 0, chk_widget)
-            # Shade on toggle
-            cb = chk
-            cb.toggled.connect(lambda checked, r=row: self._shade_row(r, checked))
+            chk.toggled.connect(lambda checked, r=row: self._shade_row(r, checked))
 
-            # Package name
+            # Items
             it_pkg = QtWidgets.QTableWidgetItem(pkg)
             self.table.setItem(row, 1, it_pkg)
 
-            # Versions
             it_cur = QtWidgets.QTableWidgetItem(current)
             it_cand = QtWidgets.QTableWidgetItem(candidate)
 
-            # Color by diff level
             lvl = version_diff_level(current, candidate)
             if lvl == "major":
                 it_cur.setBackground(QtGui.QColor("#ffe5e5"))
@@ -575,12 +591,10 @@ class AptManager(QtWidgets.QWidget):
             self.table.setItem(row, 2, it_cur)
             self.table.setItem(row, 3, it_cand)
 
-            # Arch, Origin
             self.table.setItem(row, 4, QtWidgets.QTableWidgetItem(arch))
             self.table.setItem(row, 5, QtWidgets.QTableWidgetItem(origin))
 
         self.table.resizeRowsToContents()
-        # Ensure current visual state reflects the initial checkbox (checked by default)
         for r in range(self.table.rowCount()):
             self._shade_row(r, True)
 
@@ -598,10 +612,10 @@ class AptManager(QtWidgets.QWidget):
         return pkgs
 
     def append_log(self, text: str):
-        """Append text to the log area (preserving existing content)."""
         self.log.moveCursor(QtGui.QTextCursor.MoveOperation.End)
         self.log.insertPlainText(text if text.endswith("\n") else text + "\n")
         self.log.moveCursor(QtGui.QTextCursor.MoveOperation.End)
+
 
 # --------------------------
 # App bootstrap
@@ -610,7 +624,6 @@ class AptManager(QtWidgets.QWidget):
 def main():
     app = QtWidgets.QApplication(sys.argv)
 
-    # Try to use a monospaced font for better alignment of logs/table
     preferred = [
         "Optima", "Futura",
         "Fira Code", "JetBrains Mono", "Cascadia Code", "Source Code Pro",
@@ -628,6 +641,7 @@ def main():
     w = AptManager()
     w.show()
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()
