@@ -6,8 +6,12 @@ Simple APT Manager (PyQt6) — sudo prompt, version color highlighting, and prog
 
 Modifications:
 - On startup, automatically run "apt list --upgradable" flow (i.e. sudo apt-get update -> apt list ...)
-- Added a checkbox "Refresh list after upgrade" (default: ON). If checked, after successful upgrade it re-runs the list.
-- All apt-related commands (update / upgrade / list) are run with LC_ALL=C (and LANG=C) so that parsing is stable.
+- Added a checkbox "Refresh list after upgrade" (default: ON).
+- All apt-related commands are executed with LC_ALL=C / LANG=C to keep output parsable.
+- NEW: Added "Check autoremove" button.
+  - Runs `sudo apt-get autoremove --dry-run` to show removable packages.
+  - If user confirms, runs `sudo apt-get autoremove -y`.
+  - Still reuses the single QProcess/sudo flow.
 """
 
 import sys
@@ -28,16 +32,10 @@ APT_LIST_PATTERN = re.compile(
     re.VERBOSE,
 )
 
-# --- Version comparison helpers (SemVer-like extraction from Debian-ish versions) ---
 SEMVER_NUM = re.compile(r"(\d+)")
 
 
 def _semver_parts(ver: str):
-    """Extract up to three integer parts (major, minor, patch) from a Debian-like version.
-    - Drop epoch (X:...)
-    - Drop debian revision (-...)
-    - From the upstream part, take first three numeric groups; pad with zeros.
-    """
     if ":" in ver:
         ver = ver.split(":", 1)[1]
     if "-" in ver:
@@ -49,7 +47,6 @@ def _semver_parts(ver: str):
 
 
 def version_diff_level(current: str, candidate: str) -> str:
-    """Classify diff as 'major' / 'minor' / 'patch' / 'same' based on first differing part."""
     a = _semver_parts(current)
     b = _semver_parts(candidate)
     if a == b:
@@ -127,12 +124,14 @@ class AptManager(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Simple APT Manager")
-        self.resize(1000, 780)
+        self.resize(1080, 780)
 
         # Buttons
         self.btn_update = QtWidgets.QPushButton("apt update")
         self.btn_list = QtWidgets.QPushButton("apt list --upgradable")
         self.btn_upgrade_selected = QtWidgets.QPushButton("Upgrade Selected")
+        # NEW button
+        self.btn_autoremove_check = QtWidgets.QPushButton("Check autoremove")
         self.btn_select_all = QtWidgets.QPushButton("Select All")
         self.btn_clear_all = QtWidgets.QPushButton("Clear All")
 
@@ -172,8 +171,8 @@ class AptManager(QtWidgets.QWidget):
         top_bar.addWidget(self.btn_list)
         top_bar.addSpacing(16)
         top_bar.addWidget(self.btn_upgrade_selected)
+        top_bar.addWidget(self.btn_autoremove_check)   # NEW
         top_bar.addSpacing(16)
-        # put the new checkbox here
         top_bar.addWidget(self.chk_refresh_after_upgrade)
         top_bar.addStretch(1)
         top_bar.addWidget(self.btn_select_all)
@@ -199,7 +198,7 @@ class AptManager(QtWidgets.QWidget):
         self._pending_on_finish = None
 
         # Progress state
-        self._progress_mode = "idle"            # "idle" | "busy" | "upgrade"
+        self._progress_mode = "idle"
         self._progress_total = 0
         self._progress_done = 0
         self._seen_unpack = set()
@@ -210,11 +209,11 @@ class AptManager(QtWidgets.QWidget):
         self.btn_update.clicked.connect(self.run_apt_update)
         self.btn_list.clicked.connect(self.run_apt_list_upgradable)
         self.btn_upgrade_selected.clicked.connect(self.upgrade_selected)
+        self.btn_autoremove_check.clicked.connect(self.run_autoremove_dry_run)  # NEW
         self.btn_select_all.clicked.connect(self.select_all)
         self.btn_clear_all.clicked.connect(self.clear_all)
 
-        # NEW: run list on startup
-        # (use singleShot so that the window shows first)
+        # run list on startup
         QtCore.QTimer.singleShot(0, self.run_apt_list_upgradable)
 
     # --------------------------
@@ -226,7 +225,6 @@ class AptManager(QtWidgets.QWidget):
         self.log.clear()
         self.append_log(">> Running: sudo apt-get update")
         self._progress_busy("Fetching package indexes...")
-        # LC_ALL etc. will be set in _start_process
         self._sudo_run(["apt-get", "update"])
 
     def run_apt_list_upgradable(self):
@@ -236,20 +234,15 @@ class AptManager(QtWidgets.QWidget):
         self.append_log(">> Running: sudo apt-get update")
         self._progress_busy("Fetching package indexes...")
 
-        # Chain: after update finishes, then run apt list --upgradable
         def _after_update(exitCode, exitStatus):
-            # one-shot disconnect
             try:
                 self.proc.finished.disconnect(_after_update)
             except TypeError:
                 pass
 
-            # check sudo outcome
             self._check_sudo_result(["apt-get", "update"])
 
             self.append_log(">> Running: apt list --upgradable")
-            # env with LC_ALL=C is already set in _start_process, but
-            # we can enforce here too for clarity
             env = QtCore.QProcessEnvironment.systemEnvironment()
             env.insert("LC_ALL", "C")
             env.insert("LANG", "C")
@@ -271,15 +264,82 @@ class AptManager(QtWidgets.QWidget):
         self.append_log(">> Running: sudo apt-get install --only-upgrade -y <selected>")
         self._progress_start_upgrade(packages)
 
-        # after upgrade: check sudo result, then (optionally) refresh list
         def _after_upgrade():
             self._check_sudo_result(["apt-get", "install", "--only-upgrade", "-y"] + packages)
             if self.chk_refresh_after_upgrade.isChecked():
-                # run the whole (e) flow again
                 self.run_apt_list_upgradable()
 
         self._sudo_run(["apt-get", "install", "--only-upgrade", "-y"] + packages,
                        on_finish=_after_upgrade)
+
+    # NEW: autoremove flow
+    def run_autoremove_dry_run(self):
+        """Run `sudo apt-get autoremove --dry-run` and then show confirmation dialog."""
+        if self.proc.state() != QtCore.QProcess.ProcessState.NotRunning:
+            return
+        self.log.clear()
+        self.append_log(">> Running: sudo apt-get autoremove --dry-run")
+        self._progress_busy("Checking autoremove candidates...")
+        # after dry-run, parse and ask
+        self._sudo_run(["apt-get", "autoremove", "--dry-run"],
+                       on_finish=self._after_autoremove_dry_run)
+
+    def _after_autoremove_dry_run(self):
+        """Called after dry-run finished; parse candidates and ask user."""
+        self._check_sudo_result(["apt-get", "autoremove", "--dry-run"])
+        text = self.log.toPlainText()
+        pkgs = self._parse_autoremove_candidates(text)
+        if not pkgs:
+            QtWidgets.QMessageBox.information(self, "Autoremove", "No packages to autoremove.")
+            return
+
+        # Show confirm dialog
+        msg = QtWidgets.QMessageBox(self)
+        msg.setWindowTitle("Autoremove")
+        msg.setIcon(QtWidgets.QMessageBox.Icon.Question)
+        msg.setText("The following packages will be removed:\n" + ", ".join(pkgs))
+        msg.setInformativeText("Do you want to run `sudo apt-get autoremove -y` now?")
+        msg.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No)
+        ret = msg.exec()
+
+        if ret == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.log.clear()
+            self.append_log(">> Running: sudo apt-get autoremove -y")
+            self._progress_busy("Running autoremove...")
+            # actual autoremove
+            self._sudo_run(["apt-get", "autoremove", "-y"],
+                           on_finish=self._after_autoremove_real)
+
+    def _after_autoremove_real(self):
+        """After actual autoremove, refresh list (optional or always)."""
+        self._check_sudo_result(["apt-get", "autoremove", "-y"])
+        # autoremove後は最新の状態を見たいので、そのままリスト更新を走らせる
+        self.run_apt_list_upgradable()
+
+    @staticmethod
+    def _parse_autoremove_candidates(log_text: str) -> List[str]:
+        """
+        Parse apt-get autoremove --dry-run output (English, LC_ALL=C).
+        We look for 'The following packages will be REMOVED:' and collect subsequent lines
+        until an empty line or a line starting with '0 upgraded,' etc.
+        """
+        lines = [ln.rstrip() for ln in log_text.splitlines()]
+        pkgs: List[str] = []
+        collecting = False
+        for ln in lines:
+            if "The following packages will be REMOVED:" in ln:
+                collecting = True
+                continue
+            if collecting:
+                if not ln.strip():
+                    break
+                if re.match(r"^\d+\s+upgraded", ln):
+                    break
+                # lines may be space-separated package names
+                parts = ln.strip().split()
+                pkgs.extend(parts)
+        # unique
+        return sorted(set(pkgs))
 
     def select_all(self):
         for row in range(self.table.rowCount()):
@@ -322,7 +382,6 @@ class AptManager(QtWidgets.QWidget):
                 it.setBackground(self._unchecked_bg)
             return
 
-        # restore coloring
         it_pkg.setBackground(QtGui.QBrush())
         it_arch.setBackground(QtGui.QBrush())
         it_origin.setBackground(QtGui.QBrush())
@@ -349,13 +408,9 @@ class AptManager(QtWidgets.QWidget):
     # Process helpers
     # --------------------------
     def _start_process(self, args: List[str], on_finish=None):
-        """Start process with given args; connect finish callback.
-        Here we *always* set LC_ALL=C / LANG=C to make apt output stable.
-        """
         self._pending_on_finish = on_finish
         self._set_controls_enabled(False)
 
-        # enforce C locale on every process
         env = QtCore.QProcessEnvironment.systemEnvironment()
         env.insert("LC_ALL", "C")
         env.insert("LANG", "C")
@@ -369,14 +424,12 @@ class AptManager(QtWidgets.QWidget):
         self.btn_update.setEnabled(ok)
         self.btn_list.setEnabled(ok)
         self.btn_upgrade_selected.setEnabled(ok)
+        self.btn_autoremove_check.setEnabled(ok)
         self.btn_select_all.setEnabled(ok)
         self.btn_clear_all.setEnabled(ok)
         self.chk_refresh_after_upgrade.setEnabled(ok)
 
     def _sudo_run(self, cmd_parts: List[str], on_finish=None):
-        """Prepare `sudo -S` command and prompt for password if needed.
-        on_finish: optional callback to run *after* we check the sudo result.
-        """
         if self._session_pw_cache:
             self._sudo_password_bytes = self._session_pw_cache
             self._start_sudo_with_password(cmd_parts, on_finish=on_finish)
@@ -392,11 +445,9 @@ class AptManager(QtWidgets.QWidget):
         self._start_sudo_with_password(cmd_parts, on_finish=on_finish)
 
     def _start_sudo_with_password(self, cmd_parts: List[str], on_finish=None):
-        """Run sudo directly via QProcess and feed the password on stdin."""
         program = "sudo"
         args = ["-S", "--"] + cmd_parts
 
-        # wrap finish: first check sudo, then user-callback
         def _wrapped_finish():
             self._check_sudo_result(cmd_parts)
             if on_finish:
@@ -491,7 +542,6 @@ class AptManager(QtWidgets.QWidget):
         if data:
             self.append_log(data)
 
-            # if sudo prompts again
             if "sudo" in data.lower() and "password" in data.lower():
                 if self._sudo_password_bytes:
                     try:
@@ -499,7 +549,6 @@ class AptManager(QtWidgets.QWidget):
                     except Exception:
                         pass
 
-            # progress from dpkg/apt
             if self._progress_mode == "upgrade":
                 for line in data.splitlines():
                     s = line.strip()
@@ -559,7 +608,6 @@ class AptManager(QtWidgets.QWidget):
 
         self.table.setRowCount(len(entries))
         for row, (pkg, current, candidate, arch, origin) in enumerate(entries):
-            # Checkbox
             chk = QtWidgets.QCheckBox()
             chk.setChecked(True)
             chk_widget = QtWidgets.QWidget()
@@ -570,7 +618,6 @@ class AptManager(QtWidgets.QWidget):
             self.table.setCellWidget(row, 0, chk_widget)
             chk.toggled.connect(lambda checked, r=row: self._shade_row(r, checked))
 
-            # Items
             it_pkg = QtWidgets.QTableWidgetItem(pkg)
             self.table.setItem(row, 1, it_pkg)
 
@@ -645,4 +692,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
