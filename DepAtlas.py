@@ -3,40 +3,60 @@
 """
 Dependency Graph Visualizer (PyQt6) with strict Laplacian Spectral Clustering, 2D K-Means,
 DBSCAN (+ DBCV auto-tuning with scale normalization & noise penalty), cluster packing,
-and auto re-layout.
+auto re-layout, **and experimental TDA / Mapper views for dependency structures.**
 
 Key features:
-- List installed packages (pip list), select roots via checkboxes (Select All / Clear).
-- Build dependency (what they depend on) or dependents (who depends on them) graphs.
-- Layout on CPU (spring / kamada-kawai) or GPU (cuGraph ForceAtlas2).
-- Zoom (wheel) & pan (drag), axes hidden by default, cycles highlighted (red border).
-- Coloring modes:
-    * Degree colormap (Spectral/viridis) + colorbar legend.
-    * Spectral clustering (exact k) with categorical legend.
-    * 2D K-Means clustering (exact k) with categorical legend.
-    * DBSCAN clustering on 2D positions (variable clusters, noise shown) with categorical legend.
-- Spectral clustering pipeline (always exactly k):
-    1) Strict Laplacian spectral (normalized Laplacian, Fiedler-based bisection, per component).
-    2) sklearn SpectralClustering(affinity="precomputed").
-    3) 2D K-Means on current positions (NumPy-only).
-    4) Greedy merge of connected components to exactly k.
-- DBSCAN:
-    - Parameters: eps (QDoubleSpinBox), min_cluster_size (maps to sklearn's min_samples).
-    - Optional "Auto-tune (DBCV)" grid search (scale-normalized):
-        * Evaluate in normalized space (median 1-NN distance ≈ 1) to remove layout scale effects.
-        * Score via hdbscan.validity.validity_index (DBCV) if available, else silhouette.
-        * Penalize heavy noise: effective_score = score * sqrt(clustered_fraction).
-        * Enforce minimum coverage (≥ 30%) to avoid tiny clusters + huge noise.
-        * Fallback to 2D K-Means(k) if DBSCAN yields <2 clusters.
-- Cluster packing:
-    - When enabled, rearranges positions so each cluster forms a visible spatial “blob”.
-    - Packs clusters using a quotient graph (clusters as super-nodes), lays out per-cluster subgraphs
-      locally, then composes them with spacing and radius heuristics.
-- Export figure to PNG / SVG.
-- Log panel records fallbacks, build stats, exports, errors, and detailed DBCV decisions.
-- Changing Backend/Layout or layout params triggers automatic re-layout + redraw.
 
-written by Hiroki Funashima, 2025 
+* List installed packages (pip list), select roots via checkboxes (Select All / Clear).
+* Build **dependency** (what they depend on) or **dependents** (who depends on them) graphs.
+* Layout on CPU (spring / kamada-kawai) or GPU (cuGraph ForceAtlas2).
+* Zoom (wheel) & pan (drag), axes hidden by default, cycles highlighted (red border).
+* Coloring modes:
+
+  * Degree colormap (Spectral / viridis) + colorbar legend.
+  * Spectral clustering (exact k) with categorical legend.
+  * 2D K-Means clustering (exact k) with categorical legend.
+  * DBSCAN clustering on 2D positions (variable clusters, noise shown) with categorical legend.
+* Spectral clustering pipeline (always exactly k):
+
+  1. Strict Laplacian spectral (normalized Laplacian, Fiedler-based bisection, per component).
+  2. sklearn SpectralClustering(affinity="precomputed").
+  3. 2D K-Means on current positions (NumPy-only).
+  4. Greedy merge of connected components to exactly k.
+* DBSCAN:
+
+  * Parameters: eps (QDoubleSpinBox), min_cluster_size (maps to sklearn's min_samples).
+  * Optional **“Auto-tune (DBCV)”** grid search (scale-normalized):
+
+    * Evaluate in normalized space (median 1-NN distance ≈ 1) to remove layout scale effects.
+    * Score via hdbscan.validity.validity_index (DBCV) if available, else silhouette.
+    * Penalize heavy noise: `effective_score = score * sqrt(clustered_fraction)`.
+    * Enforce minimum coverage (≥ 30%) to avoid tiny clusters + huge noise.
+    * Fallback to 2D K-Means(k) if DBSCAN yields <2 clusters.
+* Cluster packing:
+
+  * When enabled, rearranges positions so each cluster forms a visible spatial “blob”.
+  * Packs clusters using a quotient graph (clusters as super-nodes), lays out per-cluster subgraphs
+    locally, then composes them with spacing and radius heuristics.
+* **TDA panel (experimental):**
+
+  * Builds scalar fields on the dependency graph (depth-from-roots, out-degree, betweenness).
+  * Runs a lightweight 0-dimensional persistent homology on sublevel sets over that scalar.
+  * Shows an H₀ “barcode” so you can see when connected components are born/merged as the
+    filtration grows.
+  * Uses the same graph you just built — no extra data source required.
+* **Mapper-like view (experimental):**
+
+  * Uses the same scalar as a 1D “lens”.
+  * Covers the scalar range with overlapping intervals (configurable count & overlap).
+  * Inside each interval, takes induced subgraphs and connected components → Mapper nodes.
+  * Connects nodes that share original packages → gives you a coarse topological summary of
+    “similar dependency regions”.
+* Export figure to PNG / SVG.
+* Log panel records fallbacks, build stats, exports, errors, **TDA/Mapper updates**, and detailed DBCV decisions.
+* Changing Backend/Layout or layout params triggers automatic re-layout + redraw, and the TDA/Mapper
+  panels are refreshed on each successful graph build.
+
 """
 
 from __future__ import annotations
@@ -48,6 +68,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Set
+import numpy as np
 
 import matplotlib
 import networkx as nx
@@ -561,10 +582,396 @@ class MplCanvas(FigureCanvasQTAgg):
         self.draw_idle()
 
 
+# ---------------------------------------------------------------------------
+# helpers: build dependency graph
+# ---------------------------------------------------------------------------
+
+def get_installed_distributions() -> Dict[str, im.Distribution]:
+    dists: Dict[str, im.Distribution] = {}
+    for dist in im.distributions():
+        name = dist.metadata["Name"] or dist.metadata["Summary"] or dist.locate_file
+        key = name.lower().replace("_", "-")
+        dists[key] = dist
+    return dists
+
+
+def build_dep_graph(selected: Optional[List[str]] = None) -> nx.DiGraph:
+    """
+    Build a directed graph pkg -> its requirement.
+    If `selected` is given, we BFS from those roots; otherwise include all.
+    """
+    dists = get_installed_distributions()
+    G = nx.DiGraph()
+
+    if not selected:
+        # all packages
+        for name, dist in dists.items():
+            G.add_node(name)
+            requires = dist.requires or []
+            for req in requires:
+                depname = req.split(";")[0].strip().split()[0].lower().replace("_", "-")
+                G.add_edge(name, depname)
+    else:
+        # only those reachable from selected
+        seen: Set[str] = set()
+        q: List[str] = [nm.lower().replace("_", "-") for nm in selected]
+        while q:
+            cur = q.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            G.add_node(cur)
+            dist = dists.get(cur)
+            if not dist:
+                continue
+            requires = dist.requires or []
+            for req in requires:
+                depname = req.split(";")[0].strip().split()[0].lower().replace("_", "-")
+                G.add_node(depname)
+                G.add_edge(cur, depname)
+                if depname not in seen:
+                    q.append(depname)
+
+    return G
+
+
+# ---------------------------------------------------------------------------
+# Layer 1: scalar field
+# ---------------------------------------------------------------------------
+
+def compute_depth_scalar(G: nx.DiGraph, roots: List[str]) -> Dict[str, float]:
+    if not roots:
+        if G.number_of_nodes() == 0:
+            return {}
+        roots = [list(G.nodes())[0]]
+    from collections import deque
+    depth = {n: math.inf for n in G.nodes()}
+    q = deque()
+    for r in roots:
+        if r in depth:
+            depth[r] = 0.0
+            q.append(r)
+    while q:
+        u = q.popleft()
+        du = depth[u]
+        for v in G.successors(u):
+            if depth[v] > du + 1:
+                depth[v] = du + 1
+                q.append(v)
+    finite = [d for d in depth.values() if d < math.inf]
+    maxd = max(finite) if finite else 0.0
+    for n in depth:
+        if depth[n] == math.inf:
+            depth[n] = maxd + 1.0
+    return depth
+
+
+def compute_outdeg_scalar(G: nx.DiGraph) -> Dict[str, float]:
+    return {n: float(G.out_degree(n)) for n in G.nodes()}
+
+
+def compute_betweenness_scalar(G: nx.DiGraph) -> Dict[str, float]:
+    if G.number_of_nodes() == 0:
+        return {}
+    # depend graphs are not huge → exact is OK; undirected is enough for H0
+    bc = nx.betweenness_centrality(G.to_undirected(), normalized=True)
+    return {n: float(bc.get(n, 0.0)) for n in G.nodes()}
+
+
+def compute_scalar_field(G: nx.DiGraph, mode: str, roots: List[str]) -> Dict[str, float]:
+    if mode == "depth-from-roots":
+        return compute_depth_scalar(G, roots)
+    elif mode == "out-degree":
+        return compute_outdeg_scalar(G)
+    elif mode == "betweenness":
+        return compute_betweenness_scalar(G)
+    return {n: 0.0 for n in G.nodes()}
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: 0D PH (very small)
+# ---------------------------------------------------------------------------
+
+def compute_h0_barcodes(G: nx.DiGraph, scalars: Dict[str, float]) -> List[Tuple[float, float]]:
+    """
+    Sublevel filtration on an undirected version of G.
+    Each node is born at its scalar value.
+    When two components get connected, the younger (bigger birth) dies.
+    Return list of (birth, death); "infinite" deaths will be max+δ.
+    """
+    if G.number_of_nodes() == 0 or not scalars:
+        return []
+    H = G.to_undirected()
+    # union-find
+    parent = {n: n for n in H.nodes()}
+    birth = {n: scalars[n] for n in H.nodes()}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b, level, bars):
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        # older has smaller birth
+        if birth[ra] <= birth[rb]:
+            older, younger = ra, rb
+        else:
+            older, younger = rb, ra
+        # younger dies at this level
+        bars.append((birth[younger], level))
+        parent[younger] = older
+
+    # sort nodes by scalar
+    nodes_sorted = sorted(H.nodes(), key=lambda x: scalars[x])
+    bars: List[Tuple[float, float]] = []
+    active: Set[str] = set()
+    for n in nodes_sorted:
+        active.add(n)
+        lvl = scalars[n]
+        for nb in H.neighbors(n):
+            if nb in active:
+                union(n, nb, lvl, bars)
+
+    maxv = max(scalars.values())
+    inf_death = maxv + (0.1 * maxv if maxv > 0 else 1.0)
+    # remaining reps
+    reps = set(find(n) for n in H.nodes())
+    for r in reps:
+        bars.append((birth[r], inf_death))
+    return bars
+
+
+# ---------------------------------------------------------------------------
+# Layer 3: Mapper-like view (interval cover + CC)
+# ---------------------------------------------------------------------------
+
+def build_mapper_graph(
+    G: nx.DiGraph,
+    scalars: Dict[str, float],
+    num_intervals: int = 6,
+    overlap: float = 0.25,
+) -> nx.Graph:
+    """
+    Super lightweight Mapper:
+    - lens: given by `scalars`
+    - cover: num_intervals, with given overlap (0..0.9)
+    - clustering: within each interval, take induced subgraph and split into CC
+    - result: nodes = (interval_id, component_id), edges = "non-empty intersection of clusters"
+    """
+    M = nx.Graph()
+    if not G or not scalars:
+        return M
+
+    vals = np.array(list(scalars.values()), dtype=float)
+    vmin, vmax = float(vals.min()), float(vals.max())
+    if vmin == vmax:
+        # all the same → single node
+        M.add_node((0, 0), members=list(G.nodes()))
+        return M
+
+    total = vmax - vmin
+    step = total / num_intervals
+    ov = max(0.0, min(overlap, 0.9))  # clamp
+    intervals = []
+    for i in range(num_intervals):
+        start = vmin + i * step
+        end = start + step
+        # apply overlap
+        start = start - ov * step
+        end = end + ov * step
+        intervals.append((start, end))
+
+    # for each interval, pick nodes, split into CC -> cluster nodes
+    cluster_nodes: Dict[Tuple[int, int], Set[str]] = {}
+    for idx, (a, b) in enumerate(intervals):
+        # pick nodes whose value is in [a, b]
+        bucket = [n for n, v in scalars.items() if a <= v <= b]
+        if not bucket:
+            continue
+        # induced subgraph
+        H = G.to_undirected().subgraph(bucket).copy()
+        cc_list = list(nx.connected_components(H))
+        for j, comp in enumerate(cc_list):
+            node_id = (idx, j)
+            M.add_node(node_id, members=comp, interval=idx)
+            cluster_nodes[node_id] = set(comp)
+
+    # connect clusters if they share at least one original node
+    node_ids = list(cluster_nodes.keys())
+    for i in range(len(node_ids)):
+        for j in range(i + 1, len(node_ids)):
+            a_id, b_id = node_ids[i], node_ids[j]
+            if cluster_nodes[a_id] & cluster_nodes[b_id]:
+                M.add_edge(a_id, b_id)
+
+    return M
+
+
+# ---------------------------------------------------------------------------
+# Qt Widgets
+# ---------------------------------------------------------------------------
+
+
+class TDAPanel(QWidget):
+    """Right-side small panel for scalar + H0 barcode."""
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+
+        title = QLabel("TDA (H₀) — experimental")
+        title.setStyleSheet("font-weight: 600;")
+        v.addWidget(title)
+
+        # scalar selector
+        h = QHBoxLayout()
+        h.addWidget(QLabel("Scalar:"))
+        self.combo_scalar = QComboBox()
+        self.combo_scalar.addItems(["depth-from-roots", "out-degree", "betweenness"])
+        h.addWidget(self.combo_scalar, 1)
+        v.addLayout(h)
+
+        # canvas
+        self.fig = Figure(figsize=(3.5, 1.7), constrained_layout=True)
+        self.canvas = FigureCanvasQTAgg(self.fig)
+        v.addWidget(self.canvas, 1)
+
+        self.G: Optional[nx.DiGraph] = None
+        self.roots: List[str] = []
+        self.scalars: Dict[str, float] = {}
+
+        self.combo_scalar.currentIndexChanged.connect(self.redraw)
+
+    def set_graph(self, G: nx.DiGraph, roots: List[str]):
+        self.G = G
+        self.roots = roots
+        self.redraw()
+
+    def redraw(self):
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+        ax.set_title("H₀ barcode")
+        if self.G is None or self.G.number_of_nodes() == 0:
+            ax.text(0.5, 0.5, "no graph", ha="center", va="center")
+            self.canvas.draw_idle()
+            return
+
+        mode = self.combo_scalar.currentText()
+        scalars = compute_scalar_field(self.G, mode, self.roots)
+        self.scalars = scalars
+        bars = compute_h0_barcodes(self.G, scalars)
+        if not bars:
+            ax.text(0.5, 0.5, "no bars", ha="center", va="center")
+            self.canvas.draw_idle()
+            return
+
+        # sort by birth
+        bars = sorted(bars, key=lambda x: (x[0], x[1]))
+        for i, (b, d) in enumerate(bars):
+            ax.hlines(i, b, d, linewidth=2)
+            ax.plot([b], [i], "o", markersize=3)
+        ax.set_xlabel("filtration")
+        ax.set_ylabel("component")
+        ax.set_ylim(-1, len(bars) + 1)
+        self.canvas.draw_idle()
+
+
+class MapperPanel(QWidget):
+    """Right-side panel for Mapper-like view."""
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+
+        title = QLabel("Mapper-like view")
+        title.setStyleSheet("font-weight: 600;")
+        v.addWidget(title)
+
+        h1 = QHBoxLayout()
+        h1.addWidget(QLabel("Scalar (lens):"))
+        self.combo_scalar = QComboBox()
+        self.combo_scalar.addItems(["depth-from-roots", "out-degree", "betweenness"])
+        h1.addWidget(self.combo_scalar, 1)
+        v.addLayout(h1)
+
+        h2 = QHBoxLayout()
+        h2.addWidget(QLabel("Intervals:"))
+        self.spin_intervals = QSpinBox()
+        self.spin_intervals.setRange(2, 24)
+        self.spin_intervals.setValue(6)
+        h2.addWidget(self.spin_intervals)
+        h2.addWidget(QLabel("Overlap:"))
+        self.dspin_overlap = QDoubleSpinBox()
+        self.dspin_overlap.setRange(0.0, 0.9)
+        self.dspin_overlap.setSingleStep(0.05)
+        self.dspin_overlap.setValue(0.25)
+        h2.addWidget(self.dspin_overlap)
+        v.addLayout(h2)
+
+        self.fig = Figure(figsize=(3.5, 2.0), constrained_layout=True)
+        self.canvas = FigureCanvasQTAgg(self.fig)
+        v.addWidget(self.canvas, 1)
+
+        self.G: Optional[nx.DiGraph] = None
+        self.roots: List[str] = []
+
+        self.combo_scalar.currentIndexChanged.connect(self.redraw)
+        self.spin_intervals.valueChanged.connect(self.redraw)
+        self.dspin_overlap.valueChanged.connect(self.redraw)
+
+    def set_graph(self, G: nx.DiGraph, roots: List[str]):
+        self.G = G
+        self.roots = roots
+        self.redraw()
+
+    def redraw(self):
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+        if self.G is None or self.G.number_of_nodes() == 0:
+            ax.text(0.5, 0.5, "no graph", ha="center", va="center")
+            self.canvas.draw_idle()
+            return
+
+        mode = self.combo_scalar.currentText()
+        scalars = compute_scalar_field(self.G, mode, self.roots)
+        mi = self.spin_intervals.value()
+        ov = self.dspin_overlap.value()
+
+        M = build_mapper_graph(self.G, scalars, num_intervals=mi, overlap=ov)
+        if M.number_of_nodes() == 0:
+            ax.text(0.5, 0.5, "empty cover", ha="center", va="center")
+            self.canvas.draw_idle()
+            return
+
+        # layout by interval (x) and component (y)
+        pos = {}
+        for (interval, comp_id) in M.nodes():
+            x = interval
+            y = -comp_id
+            pos[(interval, comp_id)] = (x, y)
+
+        nx.draw_networkx(
+            M,
+            pos=pos,
+            ax=ax,
+            with_labels=False,
+            node_size=200,
+            node_color=[M.nodes[n].get("interval", 0) for n in M.nodes()],
+        )
+        ax.set_title(f"Mapper nodes: {M.number_of_nodes()}")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        self.canvas.draw_idle()
+
+
 # --------------------------- Main Window -------------------------------
 
 class MainWindow(QMainWindow):
-    """Main window: controls, worker orchestration, clustering, rendering, logging, and auto re-layout."""
+    """Main window: controls, worker orchestration, clustering, rendering, logging, and TDA/Mapper rendering."""
 
     def __init__(self):
         """Construct UI, connect signals, and load package table."""
@@ -573,7 +980,8 @@ class MainWindow(QMainWindow):
         self.resize(1540, 1080)
 
         # Left: controls + table + missing list + log
-        left = QWidget(self); left_v = QVBoxLayout(left)
+        left = QWidget(self)
+        left_v = QVBoxLayout(left)
 
         # Filter row
         filter_row = QHBoxLayout()
@@ -581,7 +989,8 @@ class MainWindow(QMainWindow):
         self.edit_filter = QLineEdit()
         self.edit_filter.setPlaceholderText("Type to filter packages (case-insensitive)")
         filter_row.addWidget(self.edit_filter, 1)
-        btn_clear_filter = QPushButton("Clear"); filter_row.addWidget(btn_clear_filter)
+        btn_clear_filter = QPushButton("Clear")
+        filter_row.addWidget(btn_clear_filter)
         left_v.addLayout(filter_row)
 
         # Table: checkbox + name + version
@@ -604,16 +1013,20 @@ class MainWindow(QMainWindow):
         # Row A: Depth, Backend, Layout, Mode
         rowA = QHBoxLayout()
         rowA.addWidget(QLabel("Depth:"))
-        self.spin_depth = QSpinBox(); self.spin_depth.setRange(-1, 32); self.spin_depth.setValue(-1)
+        self.spin_depth = QSpinBox()
+        self.spin_depth.setRange(-1, 32)
+        self.spin_depth.setValue(-1)
         self.spin_depth.setToolTip("-1 = unlimited, 0 = direct only, N = depth N")
         rowA.addWidget(self.spin_depth)
 
         rowA.addWidget(QLabel("Backend:"))
-        self.combo_backend = QComboBox(); self.combo_backend.addItems(["CPU", "GPU"])
+        self.combo_backend = QComboBox()
+        self.combo_backend.addItems(["CPU", "GPU"])
         rowA.addWidget(self.combo_backend)
 
         rowA.addWidget(QLabel("Layout:"))
-        self.combo_layout = QComboBox(); self._populate_layout_options()
+        self.combo_layout = QComboBox()
+        self._populate_layout_options()
         rowA.addWidget(self.combo_layout)
 
         rowA.addWidget(QLabel("Mode:"))
@@ -621,26 +1034,36 @@ class MainWindow(QMainWindow):
         self.combo_mode.addItems(["Dependencies", "Dependents"])
         self.combo_mode.setCurrentText("Dependencies")
         rowA.addWidget(self.combo_mode)
+
         rowA.addStretch(1)
         ctrl.addLayout(rowA)
 
         # Row B: Spring iters, FA2 iters, FA2 scaling, FA2 gravity
         rowB = QHBoxLayout()
         rowB.addWidget(QLabel("Spring iters:"))
-        self.spin_spring_iter = QSpinBox(); self.spin_spring_iter.setRange(10, 5000); self.spin_spring_iter.setValue(50)
+        self.spin_spring_iter = QSpinBox()
+        self.spin_spring_iter.setRange(10, 5000)
+        self.spin_spring_iter.setValue(50)
         rowB.addWidget(self.spin_spring_iter)
 
         rowB.addWidget(QLabel("FA2 iters:"))
-        self.spin_fa2_iter = QSpinBox(); self.spin_fa2_iter.setRange(50, 5000); self.spin_fa2_iter.setValue(500)
+        self.spin_fa2_iter = QSpinBox()
+        self.spin_fa2_iter.setRange(50, 5000)
+        self.spin_fa2_iter.setValue(500)
         rowB.addWidget(self.spin_fa2_iter)
 
         rowB.addWidget(QLabel("FA2 scaling:"))
-        self.spin_fa2_scaling = QSpinBox(); self.spin_fa2_scaling.setRange(1, 50); self.spin_fa2_scaling.setValue(2)
+        self.spin_fa2_scaling = QSpinBox()
+        self.spin_fa2_scaling.setRange(1, 50)
+        self.spin_fa2_scaling.setValue(2)
         rowB.addWidget(self.spin_fa2_scaling)
 
         rowB.addWidget(QLabel("FA2 gravity:"))
-        self.spin_fa2_gravity = QSpinBox(); self.spin_fa2_gravity.setRange(0, 50); self.spin_fa2_gravity.setValue(1)
+        self.spin_fa2_gravity = QSpinBox()
+        self.spin_fa2_gravity.setRange(0, 50)
+        self.spin_fa2_gravity.setValue(1)
         rowB.addWidget(self.spin_fa2_gravity)
+
         rowB.addStretch(1)
         ctrl.addLayout(rowB)
 
@@ -652,20 +1075,26 @@ class MainWindow(QMainWindow):
         self.combo_cmap.setCurrentText("Spectral")
         rowC.addWidget(self.combo_cmap)
 
-        self.chk_arrows = QCheckBox("Arrows"); self.chk_arrows.setChecked(True)
+        self.chk_arrows = QCheckBox("Arrows")
+        self.chk_arrows.setChecked(True)
         rowC.addWidget(self.chk_arrows)
 
         rowC.addWidget(QLabel("Node size:"))
-        self.spin_node_size = QSpinBox(); self.spin_node_size.setRange(10, 4000); self.spin_node_size.setValue(100)
+        self.spin_node_size = QSpinBox()
+        self.spin_node_size.setRange(10, 4000)
+        self.spin_node_size.setValue(100)
         rowC.addWidget(self.spin_node_size)
 
         rowC.addWidget(QLabel("Font size:"))
-        self.spin_font = QSpinBox(); self.spin_font.setRange(4, 24); self.spin_font.setValue(9)
+        self.spin_font = QSpinBox()
+        self.spin_font.setRange(4, 24)
+        self.spin_font.setValue(9)
         rowC.addWidget(self.spin_font)
+
         rowC.addStretch(1)
         ctrl.addLayout(rowC)
 
-        # Row C2: Clustering controls (None / Spectral / 2D K-Means / DBSCAN) + k + Pack clusters
+        # Row C2: Clustering controls
         rowC2 = QHBoxLayout()
         rowC2.addWidget(QLabel("Clustering:"))
         self.combo_cluster = QComboBox()
@@ -674,10 +1103,11 @@ class MainWindow(QMainWindow):
         rowC2.addWidget(self.combo_cluster)
 
         rowC2.addWidget(QLabel("Clusters k:"))
-        self.spin_clusters = QSpinBox(); self.spin_clusters.setRange(2, 64); self.spin_clusters.setValue(8)
+        self.spin_clusters = QSpinBox()
+        self.spin_clusters.setRange(2, 64)
+        self.spin_clusters.setValue(8)
         rowC2.addWidget(self.spin_clusters)
 
-        # New: Pack clusters checkbox (make clusters spatially separated)
         self.chk_pack = QCheckBox("Pack clusters")
         self.chk_pack.setChecked(True)
         rowC2.addWidget(self.chk_pack)
@@ -722,7 +1152,8 @@ class MainWindow(QMainWindow):
         self.btn_select_all = QPushButton("Select All")
         self.btn_clear_sel = QPushButton("Clear Selection")
         self.btn_show = QPushButton("Show Graph ▶")
-        self.btn_cancel = QPushButton("Cancel"); self.btn_cancel.setEnabled(False)
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.setEnabled(False)
 
         rowE.addWidget(self.btn_refresh)
         rowE.addWidget(self.btn_select_all)
@@ -737,21 +1168,36 @@ class MainWindow(QMainWindow):
         # Missing list
         miss_box = QGroupBox("Missing dependencies")
         miss_v = QVBoxLayout(miss_box)
-        self.txt_missing = QPlainTextEdit(); self.txt_missing.setReadOnly(True)
+        self.txt_missing = QPlainTextEdit()
+        self.txt_missing.setReadOnly(True)
         miss_v.addWidget(self.txt_missing)
         left_v.addWidget(miss_box, 1)
 
         # Log panel
         log_box = QGroupBox("Log")
         log_v = QVBoxLayout(log_box)
-        self.txt_log = QPlainTextEdit(); self.txt_log.setReadOnly(True)
+        self.txt_log = QPlainTextEdit()
+        self.txt_log.setReadOnly(True)
         log_v.addWidget(self.txt_log)
         left_v.addWidget(log_box, 1)
 
-        # Right pane: canvas + progress
-        right = QWidget(self); right_v = QVBoxLayout(right)
-        self.canvas = MplCanvas(self); right_v.addWidget(self.canvas, 1)
-        self.progress = QProgressBar(); self.progress.setRange(0, 100); self.progress.setValue(0)
+        # Right pane: canvas + TDA + Mapper + progress
+        right = QWidget(self)
+        right_v = QVBoxLayout(right)
+        self.canvas = MplCanvas(self)
+        right_v.addWidget(self.canvas, 3)
+
+        # TDA panel (new)
+        self.tda_panel = TDAPanel(self)
+        right_v.addWidget(self.tda_panel, 1)
+
+        # Mapper panel (new)
+        self.mapper_panel = MapperPanel(self)
+        right_v.addWidget(self.mapper_panel, 1)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
         right_v.addWidget(self.progress)
 
         # Root layout
@@ -772,7 +1218,6 @@ class MainWindow(QMainWindow):
         self.cluster_labels: Dict[str, int] = {}
         self.cluster_palette: Dict[int, str] = {}
         self.dbscan_meta: Optional[Tuple[int, int, float, int, Optional[float], str]] = None
-        # (n_clusters, n_noise, eps, min_size, score, score_metric)
 
         # Connections
         self.btn_refresh.clicked.connect(self.populate_table_from_pip)
@@ -818,18 +1263,14 @@ class MainWindow(QMainWindow):
         self._enable_cluster_controls()  # set initial UI enable/disable
 
     # -------- Logging helper --------
-
     def _log(self, msg: str) -> None:
-        """Append a timestamped message to the Log panel."""
         if not hasattr(self, "txt_log"):
             return
         ts = datetime.now().strftime("%H:%M:%S")
         self.txt_log.appendPlainText(f"[{ts}] {msg}")
 
     # -------- Style helpers --------
-
     def _style_show_button(self) -> None:
-        """Apply a light-blue style to the 'Show Graph' button for visibility."""
         self.btn_show.setObjectName("btnShowGraph")
         self.setStyleSheet("""
             QPushButton#btnShowGraph {
@@ -850,35 +1291,36 @@ class MainWindow(QMainWindow):
         self.btn_show.setCursor(Qt.CursorShape.PointingHandCursor)
 
     # -------- Package table --------
-
     def populate_table_from_pip(self) -> None:
-        """Populate the table via `pip list --format=json` for this interpreter."""
         try:
             res = subprocess.run(
                 [sys.executable, "-m", "pip", "list", "--format=json"],
                 capture_output=True, text=True, check=True
             )
-            pkgs = json.loads(res.stdout)  # [{"name":..., "version":...}]
+            pkgs = json.loads(res.stdout)
         except Exception as e:
             QMessageBox.critical(self, "pip error", f"Failed to run pip list:\n{e}")
             pkgs = []
 
         self.table.setRowCount(0)
         for p in sorted(pkgs, key=lambda x: x["name"].lower()):
-            name = p.get("name", ""); ver = p.get("version", "")
+            name = p.get("name", "")
+            ver = p.get("version", "")
             if not name:
                 continue
-            row = self.table.rowCount(); self.table.insertRow(row)
-            cb = QCheckBox(); cb.setChecked(False)
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            cb = QCheckBox()
+            cb.setChecked(False)
             self.table.setCellWidget(row, 0, cb)
             self.table.setItem(row, 1, QTableWidgetItem(name))
-            vitem = QTableWidgetItem(ver); vitem.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            vitem = QTableWidgetItem(ver)
+            vitem.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table.setItem(row, 2, vitem)
         self.table.sortItems(1)
         self._log(f"[pip] listed {self.table.rowCount()} packages")
 
     def apply_filter(self) -> None:
-        """Filter rows by package name (case-insensitive substring)."""
         q = self.edit_filter.text().strip().lower()
         for row in range(self.table.rowCount()):
             name_item = self.table.item(row, 1)
@@ -886,7 +1328,6 @@ class MainWindow(QMainWindow):
             self.table.setRowHidden(row, q not in name)
 
     def _iter_selected_packages(self) -> List[str]:
-        """Return package names currently checked in the table."""
         names: List[str] = []
         for row in range(self.table.rowCount()):
             if self.table.isRowHidden(row):
@@ -899,7 +1340,6 @@ class MainWindow(QMainWindow):
         return names
 
     def select_all(self) -> None:
-        """Check all visible rows."""
         for row in range(self.table.rowCount()):
             if self.table.isRowHidden(row):
                 continue
@@ -908,16 +1348,13 @@ class MainWindow(QMainWindow):
                 w.setChecked(True)
 
     def clear_selection(self) -> None:
-        """Uncheck all rows."""
         for row in range(self.table.rowCount()):
             w = self.table.cellWidget(row, 0)
             if isinstance(w, QCheckBox):
                 w.setChecked(False)
 
     # -------- Worker orchestration --------
-
     def _populate_layout_options(self) -> None:
-        """Refresh available layout options when backend changes."""
         backend = self.combo_backend.currentText()
         self.combo_layout.blockSignals(True)
         self.combo_layout.clear()
@@ -928,7 +1365,6 @@ class MainWindow(QMainWindow):
         self.combo_layout.blockSignals(False)
 
     def show_graph(self) -> None:
-        """Launch dependency resolution & layout on a worker thread."""
         roots = self._iter_selected_packages()
         if not roots:
             QMessageBox.information(self, "No selection", "Please select at least one package.")
@@ -938,8 +1374,10 @@ class MainWindow(QMainWindow):
         depth = self.spin_depth.value()
         self.mode = "rdeps" if self.combo_mode.currentText().lower().startswith("dependents") else "deps"
 
-        self.progress.setValue(0); self.progress.setFormat("Starting...")
-        self.btn_show.setEnabled(False); self.btn_cancel.setEnabled(True)
+        self.progress.setValue(0)
+        self.progress.setFormat("Starting...")
+        self.btn_show.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
 
         self._log(f"[build] mode={self.mode}, depth={depth}, backend={self.combo_backend.currentText()}, "
                   f"layout={self.combo_layout.currentText()}, roots={len(roots)}")
@@ -966,11 +1404,12 @@ class MainWindow(QMainWindow):
         self.thread.start()
 
     def _start_layout_worker(self) -> None:
-        """Start a layout-only worker if a graph is already built."""
         if self.G is None:
             return
-        self.progress.setValue(0); self.progress.setFormat("Re-layout...")
-        self.btn_show.setEnabled(False); self.btn_cancel.setEnabled(True)
+        self.progress.setValue(0)
+        self.progress.setFormat("Re-layout...")
+        self.btn_show.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
 
         self._log(f"[layout] backend={self.combo_backend.currentText()}, layout={self.combo_layout.currentText()} "
                   f"(iters: spring={self.spin_spring_iter.value()}, fa2={self.spin_fa2_iter.value()})")
@@ -990,29 +1429,29 @@ class MainWindow(QMainWindow):
         self.lworker.progress.connect(self.on_worker_progress)
         self.lworker.finished.connect(self.on_layout_finished)
         self.lworker.failed.connect(self.on_worker_failed)
-        # cleanup
         self.lworker.finished.connect(lambda *_: self._cleanup_layout_worker())
         self.lworker.failed.connect(lambda *_: self._cleanup_layout_worker())
         self.lthread.start()
 
     def _cleanup_worker(self) -> None:
-        """Tear down the graph worker thread and re-enable buttons."""
         try:
-            self.thread.quit(); self.thread.wait()
+            self.thread.quit()
+            self.thread.wait()
         except Exception:
             pass
-        self.btn_show.setEnabled(True); self.btn_cancel.setEnabled(False)
+        self.btn_show.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
 
     def _cleanup_layout_worker(self) -> None:
-        """Tear down the layout-only worker thread and re-enable buttons."""
         try:
-            self.lthread.quit(); self.lthread.wait()
+            self.lthread.quit()
+            self.lthread.wait()
         except Exception:
             pass
-        self.btn_show.setEnabled(True); self.btn_cancel.setEnabled(False)
+        self.btn_show.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
 
     def cancel_worker(self) -> None:
-        """Request cancellation of the running worker (if any)."""
         if hasattr(self, "worker") and getattr(self, "worker", None):
             try:
                 self.worker.cancel()
@@ -1021,44 +1460,59 @@ class MainWindow(QMainWindow):
         self._log("[build/layout] cancellation requested")
 
     def on_worker_progress(self, pct: int, msg: str) -> None:
-        """Update progress bar from worker callbacks."""
-        self.progress.setValue(pct); self.progress.setFormat(msg)
+        self.progress.setValue(pct)
+        self.progress.setFormat(msg)
 
     def on_worker_finished(self, G: nx.DiGraph, info: Dict[str, NodeInfo],
                            pos: PosDict) -> None:
-        """Receive graph, info, layout; recompute clustering and draw."""
         self._log(f"[ready] nodes={G.number_of_nodes()}, edges={G.number_of_edges()}")
-        self.G = G; self.info = info; self.pos = pos
+        self.G = G
+        self.info = info
+        self.pos = pos
         self._update_missing_list()
         self._update_clusters()
         self._draw_graph()
 
+        # --- TDA / Mapper update ---
+        try:
+            if hasattr(self, "tda_panel") and self.tda_panel is not None:
+                self.tda_panel.set_graph(G, self.root_names)
+                self._log("[tda] H₀ barcode updated.")
+        except Exception as e:
+            self._log(f"[tda] update failed: {e}")
+
+        try:
+            if hasattr(self, "mapper_panel") and self.mapper_panel is not None:
+                self.mapper_panel.set_graph(G, self.root_names)
+                self._log("[mapper] view updated.")
+        except Exception as e:
+            self._log(f"[mapper] update failed: {e}")
+
     def on_layout_finished(self, pos: PosDict) -> None:
-        """Update positions after a layout-only run, refresh clustering if needed, and redraw."""
         self.pos = pos
-        # If clustering depends on positions, recompute
         if self.combo_cluster.currentText().lower().startswith(("2d", "dbscan")):
             self._update_clusters()
         self._draw_graph()
 
+        # keep TDA/Mapper in sync (optional)
+        if hasattr(self, "tda_panel") and self.tda_panel is not None and self.G is not None:
+            self.tda_panel.set_graph(self.G, self.root_names)
+        if hasattr(self, "mapper_panel") and self.mapper_panel is not None and self.G is not None:
+            self.mapper_panel.set_graph(self.G, self.root_names)
+
     def on_worker_failed(self, error_msg: str) -> None:
-        """Show a human-readable error from the worker."""
         self._log(f"[error] {error_msg}")
         QMessageBox.warning(self, "Operation failed", error_msg)
 
     # -------- Auto re-layout triggers --------
-
     def _on_backend_changed(self) -> None:
-        """When backend changes, refresh layout choices and re-layout if graph exists."""
         self._populate_layout_options()
         self._start_layout_worker()
 
     def _on_layout_changed(self) -> None:
-        """When layout combo changes, re-layout if graph exists."""
         self._start_layout_worker()
 
     def _on_layout_params_changed(self) -> None:
-        """When layout parameters (iters/scaling/gravity) change, re-layout if graph exists."""
         self._start_layout_worker()
 
     # -------- Clustering (strict-k + DBSCAN) --------
@@ -1089,7 +1543,6 @@ class MainWindow(QMainWindow):
         Works per connected component, using Fiedler vector bisection.
         Requires: numpy, scipy.sparse, scipy.sparse.linalg.eigsh
         """
-        import numpy as np
         from scipy.sparse import csr_matrix, identity
         from scipy.sparse.linalg import eigsh
 
@@ -1180,7 +1633,6 @@ class MainWindow(QMainWindow):
 
     def _cluster_kmeans_on_positions(self, nodes: List[str], k: int) -> Dict[str, int]:
         """Cluster nodes into exactly k groups using K-Means on 2D positions (NumPy-only)."""
-        import numpy as np
 
         if any(n not in self.pos for n in nodes):
             self.pos = self._ensure_positions(self.G, self.pos)
@@ -1263,7 +1715,6 @@ class MainWindow(QMainWindow):
         (labels_map, n_clusters, n_noise)
             labels_map contains -1 for noise, cluster ids are remapped to 0..C-1.
         """
-        import numpy as np
         try:
             from sklearn.cluster import DBSCAN
         except Exception as e:
@@ -1289,7 +1740,6 @@ class MainWindow(QMainWindow):
 
     def _nn_median_distance(self, X) -> float:
         """Estimate a typical neighborhood scale via median nearest-neighbor distance."""
-        import numpy as np
         n = len(X)
         if n <= 1:
             return 1.0
@@ -1310,7 +1760,6 @@ class MainWindow(QMainWindow):
         -------
         (score, metric_name) or None if cannot compute a valid score.
         """
-        import numpy as np
         labels = np.asarray(labels, dtype=int)
         mask = labels >= 0
         if mask.sum() < 2 or len(set(labels[mask])) < 2:
@@ -1350,7 +1799,6 @@ class MainWindow(QMainWindow):
         -------
         (labels_map, n_clusters, n_noise, best_eps, best_min, best_score, metric_name)
         """
-        import numpy as np
         try:
             from sklearn.cluster import DBSCAN  # noqa: F401
         except Exception as e:
@@ -1428,7 +1876,6 @@ class MainWindow(QMainWindow):
         """
         if not self.cluster_labels or self.G is None:
             return
-        import numpy as np
 
         G = self.G
         labels = self.cluster_labels
@@ -1546,7 +1993,6 @@ class MainWindow(QMainWindow):
             except Exception:
                 spectral_ok = False
                 try:
-                    import numpy as np
                     from scipy import sparse
                     from sklearn.cluster import SpectralClustering
                     try:
