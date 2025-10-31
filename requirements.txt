@@ -1,0 +1,26 @@
+# Core GUI/runtime
+PyQt6>=6.6
+
+# Visualization / graph
+matplotlib>=3.8
+networkx>=3.3
+
+# Packaging / version handling
+packaging>=24.0
+importlib-metadata>=8.0; python_version < "3.10"
+
+# Data / math (used mainly by DepAtlas advanced features)
+numpy>=1.26
+pandas>=2.2
+scipy>=1.13
+
+# Clustering (DepAtlas: DBCV/hdbscan-based scoring)
+hdbscan>=0.8.37
+
+# pip tools (PipLens)
+pip-review>=1.3.0
+
+# ---- optional / environment-specific ----
+# For GPU-based layouts in DepAtlas (install only if you have RAPIDS/cuDF available)
+# cudf
+# cugraph
